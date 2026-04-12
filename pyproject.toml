@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mafia"
+version = "0.1.0"
+description = "Event-driven multi-agent conversation harness inspired by Time to Talk"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.0,<3.0",
+    "iriai-compose @ git+https://github.com/thedanielzhang/iriai-compose.git@842fd3bffe978fbd2c0a0604e0ce57090dd85fc8",
+    "PyYAML>=6.0",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+mafia = "mafia.cli:main"
+mafia-service = "mafia.service:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mafia"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"

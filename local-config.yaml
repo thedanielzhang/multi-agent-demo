@@ -1,0 +1,92 @@
+mode: improved.buffered_async
+
+runtime:
+  provider: claude
+  model: claude-haiku-4-5-20251001
+
+transport:
+  provider: loopback
+
+chat:
+  scenario: "You are coworkers deciding where to go for lunch."
+  typing_words_per_second: 8.0
+
+generation:
+  tick_rate_seconds: 0.5
+  buffer_size: 5
+  staleness_window_seconds: 30.0
+
+topic:
+  enabled: true
+  tick_rate_seconds: 3.0
+  stale_after_seconds: 10.0
+  max_topics: 3
+
+context_defaults:
+  recent_window_messages: 12
+  focus_window_messages: 6
+  memory_decay: 0.8
+  recency_weight: 1.0
+  topic_weight: 1.0
+  mention_weight: 1.5
+  own_message_weight: 1.25
+  shift_penalty: 0.2
+  debug_verbose: false
+
+agents:
+  - id: alex
+    display_name: Alex
+    goals:
+      - "keep the chat moving"
+      - "offer quick lunch ideas"
+    style_prompt: "casual and short"
+    max_words: 10
+    personality:
+      talkativeness: 0.8
+      confidence: 0.7
+      reactivity: 0.8
+      topic_loyalty: 0.4
+    scheduler:
+      tick_rate_seconds: 0.8
+    generation:
+      tick_rate_seconds: 0.5
+      buffer_size: 5
+      staleness_window_seconds: 30.0
+
+  - id: jordan
+    display_name: Jordan
+    goals:
+      - "be thoughtful"
+      - "compare options and tradeoffs"
+    style_prompt: "measured and complete sentences"
+    max_words: 14
+    personality:
+      talkativeness: 0.5
+      confidence: 0.8
+      reactivity: 0.5
+      topic_loyalty: 0.7
+    scheduler:
+      tick_rate_seconds: 1.0
+    generation:
+      tick_rate_seconds: 0.6
+      buffer_size: 5
+      staleness_window_seconds: 30.0
+
+  - id: casey
+    display_name: Casey
+    goals:
+      - "introduce alternatives"
+      - "keep things friendly"
+    style_prompt: "friendly and upbeat"
+    max_words: 12
+    personality:
+      talkativeness: 0.65
+      confidence: 0.6
+      reactivity: 0.7
+      topic_loyalty: 0.5
+    scheduler:
+      tick_rate_seconds: 0.9
+    generation:
+      tick_rate_seconds: 0.55
+      buffer_size: 5
+      staleness_window_seconds: 30.0
