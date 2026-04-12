@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify_topic(value: str) -> str:
+    text = _NON_ALNUM_RE.sub("-", value.lower()).strip("-")
+    return text or "topic"
 
 
 def utc_now() -> datetime:
@@ -18,17 +27,261 @@ class SenderKind(StrEnum):
     SYSTEM = "system"
 
 
+class MafiaGameStatus(StrEnum):
+    LOBBY = "lobby"
+    ACTIVE = "active"
+    GAME_OVER = "game_over"
+
+
+class MafiaPhase(StrEnum):
+    LOBBY = "lobby"
+    DAY_DISCUSSION = "day_discussion"
+    DAY_VOTE = "day_vote"
+    DAY_REVEAL = "day_reveal"
+    NIGHT_ACTION = "night_action"
+    NIGHT_REVEAL = "night_reveal"
+
+
+class MafiaRole(StrEnum):
+    TOWN = "town"
+    MAFIA = "mafia"
+    SPECTATOR = "spectator"
+
+
+class MafiaFaction(StrEnum):
+    TOWN = "town"
+    MAFIA = "mafia"
+    NONE = "none"
+
+
+class MafiaTargetChoice(BaseModel):
+    voter_participant_id: str
+    target_participant_id: str | None = None
+
+
+class MafiaRosterEntry(BaseModel):
+    participant_id: str
+    display_name: str
+    is_human: bool = False
+    alive: bool = True
+    seat_index: int
+    faction: MafiaFaction | None = None
+
+
+class MafiaRevealRecord(BaseModel):
+    phase: MafiaPhase
+    participant_id: str | None = None
+    display_name: str | None = None
+    faction: MafiaFaction | None = None
+    eliminated: bool = False
+    reason: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class MafiaPrivateState(BaseModel):
+    participant_id: str
+    role: MafiaRole = MafiaRole.SPECTATOR
+    faction: MafiaFaction = MafiaFaction.NONE
+    alive: bool = False
+    can_chat: bool = False
+    can_vote: bool = False
+    can_act: bool = False
+    legal_targets: list[str] = Field(default_factory=list)
+    selected_target_participant_id: str | None = None
+    teammates: list[str] = Field(default_factory=list)
+    spectator: bool = True
+
+
+class MafiaPublicState(BaseModel):
+    game_status: MafiaGameStatus = MafiaGameStatus.LOBBY
+    phase: MafiaPhase = MafiaPhase.LOBBY
+    phase_started_at: datetime | None = None
+    phase_ends_at: datetime | None = None
+    total_players: int = 0
+    round_no: int = 0
+    roster: list[MafiaRosterEntry] = Field(default_factory=list)
+    revealed_eliminations: list[MafiaRevealRecord] = Field(default_factory=list)
+    winner: MafiaFaction | None = None
+    winning_participant_ids: list[str] = Field(default_factory=list)
+
+
+class MafiaPlayerRecord(BaseModel):
+    participant_id: str
+    display_name: str
+    is_human: bool
+    seat_index: int
+    alive: bool = True
+    role: MafiaRole = MafiaRole.TOWN
+    faction: MafiaFaction = MafiaFaction.TOWN
+    connected: bool = False
+
+
+class MafiaGameSnapshot(BaseModel):
+    game_status: MafiaGameStatus = MafiaGameStatus.LOBBY
+    phase: MafiaPhase = MafiaPhase.LOBBY
+    phase_started_at: datetime | None = None
+    phase_ends_at: datetime | None = None
+    total_players: int = 0
+    round_no: int = 0
+    players: list[MafiaPlayerRecord] = Field(default_factory=list)
+    spectators: list[str] = Field(default_factory=list)
+    revealed_eliminations: list[MafiaRevealRecord] = Field(default_factory=list)
+    winner: MafiaFaction | None = None
+    winning_participant_ids: list[str] = Field(default_factory=list)
+    day_votes: dict[str, str] = Field(default_factory=dict)
+    night_votes: dict[str, str] = Field(default_factory=dict)
+    ready_humans: list[str] = Field(default_factory=list)
+
+    def public_state(self) -> MafiaPublicState:
+        return MafiaPublicState(
+            game_status=self.game_status,
+            phase=self.phase,
+            phase_started_at=self.phase_started_at,
+            phase_ends_at=self.phase_ends_at,
+            total_players=self.total_players,
+            round_no=self.round_no,
+            roster=[
+                MafiaRosterEntry(
+                    participant_id=player.participant_id,
+                    display_name=player.display_name,
+                    is_human=player.is_human,
+                    alive=player.alive,
+                    seat_index=player.seat_index,
+                    faction=player.faction if self.game_status == MafiaGameStatus.GAME_OVER else None,
+                )
+                for player in sorted(self.players, key=lambda item: item.seat_index)
+            ],
+            revealed_eliminations=list(self.revealed_eliminations),
+            winner=self.winner,
+            winning_participant_ids=list(self.winning_participant_ids),
+        )
+
+    def private_state_for(self, participant_id: str) -> MafiaPrivateState:
+        player = next((item for item in self.players if item.participant_id == participant_id), None)
+        if player is None:
+            return MafiaPrivateState(participant_id=participant_id)
+        teammates = [
+            item.participant_id
+            for item in self.players
+            if item.participant_id != participant_id and item.alive and item.faction == MafiaFaction.MAFIA
+        ]
+        can_chat = player.alive and self.phase == MafiaPhase.DAY_DISCUSSION and self.game_status == MafiaGameStatus.ACTIVE
+        can_vote = player.alive and self.phase == MafiaPhase.DAY_VOTE and self.game_status == MafiaGameStatus.ACTIVE
+        can_act = (
+            player.alive
+            and player.faction == MafiaFaction.MAFIA
+            and self.phase == MafiaPhase.NIGHT_ACTION
+            and self.game_status == MafiaGameStatus.ACTIVE
+        )
+        legal_targets = []
+        if can_vote:
+            legal_targets = [item.participant_id for item in self.players if item.alive and item.participant_id != participant_id]
+        elif can_act:
+            legal_targets = [
+                item.participant_id
+                for item in self.players
+                if item.alive and item.participant_id != participant_id and item.faction != MafiaFaction.MAFIA
+            ]
+        selected_target_participant_id = None
+        if can_vote:
+            selected_target_participant_id = self.day_votes.get(participant_id)
+        elif can_act:
+            selected_target_participant_id = self.night_votes.get(participant_id)
+        return MafiaPrivateState(
+            participant_id=participant_id,
+            role=player.role,
+            faction=player.faction,
+            alive=player.alive,
+            can_chat=can_chat,
+            can_vote=can_vote,
+            can_act=can_act,
+            legal_targets=legal_targets,
+            selected_target_participant_id=selected_target_participant_id,
+            teammates=teammates if player.faction == MafiaFaction.MAFIA else [],
+            spectator=False,
+        )
+
+
+class MafiaVoteInputSnapshot(BaseModel):
+    scenario: str
+    phase: MafiaPhase
+    seconds_remaining: float = 0.0
+    roster: list[MafiaRosterEntry] = Field(default_factory=list)
+    recent_messages: list[ConversationMessage] = Field(default_factory=list)
+    private_state: MafiaPrivateState
+    legal_targets: list[str] = Field(default_factory=list)
+    revealed_eliminations: list[MafiaRevealRecord] = Field(default_factory=list)
+
+
+class MafiaVoteReply(BaseModel):
+    target_participant_id: str | None = None
+    reason: str = ""
+
+
 class TopicWeight(BaseModel):
     topic_id: str
     weight: float
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_weight(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"topic_id": f"topic-{_slugify_topic(value)}", "weight": 1.0}
+        if isinstance(value, dict):
+            data = dict(value)
+            topic_id = data.get("topic_id") or data.get("label")
+            if topic_id:
+                data["topic_id"] = (
+                    topic_id
+                    if str(topic_id).startswith("topic-")
+                    else f"topic-{_slugify_topic(str(topic_id))}"
+                )
+            data.setdefault("weight", 1.0)
+            return data
+        return value
+
 
 class TopicSummary(BaseModel):
-    topic_id: str
+    topic_id: str = ""
     label: str
-    keywords: list[str]
-    weight: float
-    confidence: float
+    keywords: list[str] = Field(default_factory=list)
+    weight: float = 0.5
+    confidence: float = 0.5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_topic(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {
+                "topic_id": f"topic-{_slugify_topic(value)}",
+                "label": value,
+                "keywords": [value],
+                "weight": 0.5,
+                "confidence": 0.5,
+            }
+        if isinstance(value, dict):
+            data = dict(value)
+            label = str(data.get("label") or data.get("name") or data.get("topic") or "").strip()
+            keywords = data.get("keywords") or []
+            if isinstance(keywords, str):
+                keywords = [item.strip() for item in keywords.split(",") if item.strip()]
+            if not label:
+                if keywords:
+                    label = str(keywords[0])
+                elif data.get("topic_id"):
+                    label = str(data["topic_id"]).replace("topic-", "").replace("-", " ")
+            data["label"] = label or "topic"
+            data["keywords"] = list(keywords) or [data["label"]]
+            topic_id = data.get("topic_id") or data["label"]
+            data["topic_id"] = (
+                topic_id
+                if str(topic_id).startswith("topic-")
+                else f"topic-{_slugify_topic(str(topic_id))}"
+            )
+            data.setdefault("weight", 0.5)
+            data.setdefault("confidence", 0.5)
+            return data
+        return value
 
 
 class TopicShift(BaseModel):
@@ -142,6 +395,8 @@ class GeneratorInputSnapshot(BaseModel):
     agent_context: AgentContextSnapshot
     max_words: int
     style_prompt: str
+    mafia_public_state: MafiaPublicState | None = None
+    mafia_private_state: MafiaPrivateState | None = None
 
 
 class SchedulerInputSnapshot(BaseModel):
@@ -158,6 +413,8 @@ class SchedulerInputSnapshot(BaseModel):
     inflight_similarity_score: float = 0.0
     similar_inflight_text: str | None = None
     other_agents_typing_count: int = 0
+    mafia_public_state: MafiaPublicState | None = None
+    mafia_private_state: MafiaPrivateState | None = None
 
 
 class SchedulerReply(BaseModel):
@@ -172,6 +429,27 @@ class GeneratorReply(BaseModel):
 class AnalyzerReply(BaseModel):
     topics: list[TopicSummary]
     message_topics: dict[str, list[TopicWeight]] = Field(default_factory=dict)
+
+    @field_validator("topics", mode="before")
+    @classmethod
+    def _coerce_topics(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return list(value.values())
+        if value is None:
+            return []
+        return value
+
+    @field_validator("message_topics", mode="before")
+    @classmethod
+    def _coerce_message_topics(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return {}
+        cleaned: dict[str, list[Any]] = {}
+        for message_id, weights in value.items():
+            if not isinstance(weights, list):
+                continue
+            cleaned[str(message_id)] = weights
+        return cleaned
 
 
 class DeliveryReservation(BaseModel):

@@ -5,15 +5,21 @@ import json
 import os
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from mafia.config import ModeProfile
+from mafia.config import ModeProfile, RoomMode
+from mafia.agent import AgentInvoker
+from mafia.compose_compat import Workspace
 from mafia.engine import ConversationEngine, load_config
 from mafia.event_log import EventLog
-from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, RoomMetricsSnapshot, TopicSummary
+from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, MafiaFaction, MafiaGameSnapshot, MafiaGameStatus, MafiaPhase, MafiaPlayerRecord, MafiaPrivateState, MafiaPublicState, MafiaRole, RoomMetricsSnapshot, TopicSummary, make_event, utc_now
+from mafia.mafia_controller import MafiaGameController, mafia_count_for_players
 from mafia.messages import CandidateRecord, ConversationMessage
+from mafia.mafia_personas import generate_mafia_personas
 from mafia.policies import PolicySet
 from mafia.projections import ProjectionRegistry
 from mafia.runtimes import ScriptedAgentRuntime
@@ -80,14 +86,81 @@ class SlowGeneratorRuntime(ScriptedAgentRuntime):
         return await super().invoke(role, prompt, **kwargs)
 
 
+class SlowSchedulerRuntime(ScriptedAgentRuntime):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        if role.name == "scheduler":
+            await asyncio.sleep(self.delay_seconds)
+        return await super().invoke(role, prompt, **kwargs)
+
+
+class CountingSlowGeneratorRuntime(ScriptedAgentRuntime):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+        self.scheduler_calls = 0
+        self.generator_calls = 0
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        if role.name == "scheduler":
+            self.scheduler_calls += 1
+        if role.name == "generator":
+            self.generator_calls += 1
+            await asyncio.sleep(self.delay_seconds)
+        return await super().invoke(role, prompt, **kwargs)
+
+
+class RecordingRuntime(ScriptedAgentRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str, str | None, str | None]] = []
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        workspace = kwargs.get("workspace")
+        self.calls.append(
+            (
+                role.metadata.get("agent_id", "agent"),
+                role.name,
+                kwargs.get("session_key"),
+                str(workspace.path) if workspace is not None else None,
+            )
+        )
+        return await super().invoke(role, prompt, **kwargs)
+
+
+class SlowAnalyzerRuntime(ScriptedAgentRuntime):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        if role.name == "analyzer":
+            await asyncio.sleep(self.delay_seconds)
+        return await super().invoke(role, prompt, **kwargs)
+
+
+class SlowVoterRuntime(ScriptedAgentRuntime):
+    def __init__(self, delay_seconds: float) -> None:
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        if role.name == "voter":
+            await asyncio.sleep(self.delay_seconds)
+        return await super().invoke(role, prompt, **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_append_then_publish_updates_projection_before_event_observer(improved_config):
     engine = ConversationEngine(improved_config)
     observed = asyncio.Event()
 
-    async def handler(_subject, event):
-        if event.subject == "conversation.event.message.committed":
-            assert engine.registry.has_client_message_id(event.payload["client_message_id"])
+    async def handler(_subject, logged: LoggedEvent):
+        if logged.event.subject == "conversation.event.message.committed":
+            assert engine.registry.has_client_message_id(logged.event.payload["client_message_id"])
             observed.set()
 
     engine.bus.subscribe("conversation.event.message.committed", handler, maxsize=16, overflow="block")
@@ -163,12 +236,454 @@ async def test_baseline_mode_is_serial_and_uses_paper_style_prompt(baseline_conf
             continue
         assert logged.seq > send_seq_by_agent[logged.event.payload["agent_id"]]
 
-    scheduler_prompts = [prompt for role_name, prompt in runtime.calls if role_name == "scheduler"]
-    assert scheduler_prompts
-    prompt = scheduler_prompts[0]
-    assert "Conversation history with timestamps" in prompt
-    assert "Goals:" in prompt
-    assert "Current pacing mode:" in prompt
+
+def test_seeded_mafia_personas_include_chatroom_style_guidance():
+    personas = generate_mafia_personas("table-7", 5)
+    assert len(personas) == 5
+    for persona in personas:
+        assert "live group chat" in persona.style_prompt
+        assert "stage directions" in persona.style_prompt
+        assert persona.personality.reactivity >= 1.0
+        assert persona.personality.talkativeness >= 0.88
+        assert persona.personality.confidence >= 0.88
+        assert persona.generation.buffer_size == 1
+        assert persona.generation.staleness_window_seconds == 7.0
+
+
+def test_seeded_mafia_personas_cover_distinct_interaction_vectors_before_repeating():
+    personas = generate_mafia_personas("vector-table", 8)
+    archetype_markers = {persona.goals[-1] for persona in personas}
+    talkativeness = [persona.personality.talkativeness for persona in personas]
+    confidence = [persona.personality.confidence for persona in personas]
+    topic_loyalty = [persona.personality.topic_loyalty for persona in personas]
+
+    assert len(archetype_markers) == 8
+    assert max(talkativeness) - min(talkativeness) >= 0.12
+    assert max(confidence) - min(confidence) >= 0.12
+    assert max(topic_loyalty) - min(topic_loyalty) >= 0.5
+
+
+def test_mafia_generator_prompt_reinforces_chatroom_message_style(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    context = AgentContextSnapshot(
+        agent_id=config.agents[0].id,
+        watermark=3,
+        current_time=utc_now(),
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(),
+    )
+    prompt = policies.prompts.generator_prompt(
+        config.agents[0],
+        policies.generator_input(config.agents[0], context),
+    )
+    assert "real player in a live chat room" in prompt
+    assert "No stage directions" in prompt
+
+
+def test_mafia_generator_prompt_includes_private_role_context(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    context = AgentContextSnapshot(
+        agent_id=config.agents[0].id,
+        watermark=3,
+        current_time=utc_now(),
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(),
+    )
+    prompt = policies.prompts.generator_prompt(
+        config.agents[0],
+        policies.generator_input(
+            config.agents[0],
+            context,
+            mafia_public_state=MafiaPublicState(game_status=MafiaGameStatus.ACTIVE, phase=MafiaPhase.DAY_DISCUSSION),
+            mafia_private_state=MafiaPrivateState(
+                participant_id=config.agents[0].id,
+                role="mafia",
+                faction=MafiaFaction.MAFIA,
+                alive=True,
+                spectator=False,
+                teammates=["teammate-2"],
+            ),
+        ),
+    )
+    assert "Your private role: mafia" in prompt
+    assert "Known mafia teammates: teammate-2" in prompt
+    assert "This message is public table chat" in prompt
+
+
+def test_mafia_pre_day_spinup_candidates_stay_fresh_until_day_opens(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.mafia.night_reveal_seconds = 30.0
+    policies = PolicySet(config)
+    agent = config.agents[0]
+    now = utc_now()
+    candidate = CandidateRecord(
+        candidate_id="pre-day-1",
+        agent_id=agent.id,
+        text="we should compare notes before voting again",
+        created_at=now - timedelta(seconds=25),
+        metadata={"mafia_pre_day_spinup": True},
+    )
+    assert policies.candidate_is_stale(agent, candidate, now) is False
+
+
+def test_mafia_vote_resolution_reveals_eliminated_faction():
+    controller = MafiaGameController(SimpleNamespace())
+    snapshot = MafiaGameSnapshot(
+        game_status=MafiaGameStatus.ACTIVE,
+        phase=MafiaPhase.DAY_VOTE,
+        players=[
+            MafiaPlayerRecord(participant_id="p1", display_name="Alex", is_human=True, seat_index=0, role=MafiaRole.MAFIA, faction=MafiaFaction.MAFIA),
+            MafiaPlayerRecord(participant_id="p2", display_name="Jordan", is_human=True, seat_index=1, role=MafiaRole.TOWN, faction=MafiaFaction.TOWN),
+        ],
+        day_votes={"p2": "p1"},
+    )
+    next_snapshot, revealed = controller._resolve_day_vote(snapshot)
+    assert revealed["eliminated_participant_id"] == "p1"
+    assert revealed["eliminated_faction"] == "mafia"
+    assert "They were mafia" in revealed["summary"]
+    assert next_snapshot.revealed_eliminations[-1].faction == MafiaFaction.MAFIA
+
+
+@pytest.mark.asyncio
+async def test_mafia_start_game_avoids_duplicate_seeded_display_names(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.mafia.total_players = 5
+    config.agents = generate_mafia_personas("duped-table", 5)
+    config.agents[1].display_name = config.agents[0].display_name
+    engine = ConversationEngine(config)
+    await engine.start()
+    await engine.dispatch_command(
+        CommandEnvelope(
+            subject="mafia.command.game.start",
+            payload={"humans": []},
+        )
+    )
+    snapshot = engine.registry.mafia_snapshot()
+    assert snapshot is not None
+    names = [player.display_name.casefold() for player in snapshot.players]
+    assert len(names) == len(set(names))
+    await _shutdown(engine)
+
+
+def test_mafia_vote_prompt_does_not_label_players_as_human_or_agent(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    prompt = policies.prompts.mafia_vote_prompt(
+        config.agents[0],
+        policies.mafia_vote_input(
+            config.agents[0],
+            MafiaPublicState(
+                game_status=MafiaGameStatus.ACTIVE,
+                phase=MafiaPhase.DAY_VOTE,
+                roster=[
+                    {"participant_id": "alex", "display_name": "Alex", "is_human": True, "seat_index": 0, "alive": True},
+                    {"participant_id": "casey", "display_name": "Casey", "is_human": False, "seat_index": 1, "alive": True},
+                ],
+            ),
+            MafiaPrivateState(
+                participant_id=config.agents[0].id,
+                role=MafiaRole.TOWN,
+                faction=MafiaFaction.TOWN,
+                alive=True,
+                can_vote=True,
+            ),
+            [],
+        ),
+    )
+    assert "(human," not in prompt
+    assert "(agent," not in prompt
+    assert "- Alex (alive)" in prompt
+
+
+def test_agent_input_json_strips_is_human_from_mafia_payloads(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    invoker = AgentInvoker(
+        ScriptedAgentRuntime(),
+        "run-test",
+        Workspace(id="ws-test", path=ROOT),
+    )
+    prompt = invoker._compose_prompt(
+        "vote prompt",
+        PolicySet(config).mafia_vote_input(
+            config.agents[0],
+            MafiaPublicState(
+                game_status=MafiaGameStatus.ACTIVE,
+                phase=MafiaPhase.DAY_VOTE,
+                roster=[
+                    {"participant_id": "alex", "display_name": "Alex", "is_human": True, "seat_index": 0, "alive": True},
+                ],
+            ),
+            MafiaPrivateState(
+                participant_id=config.agents[0].id,
+                role=MafiaRole.TOWN,
+                faction=MafiaFaction.TOWN,
+                alive=True,
+                can_vote=True,
+            ),
+            [],
+        ),
+    )
+    assert "\"is_human\"" not in prompt
+    assert "\"display_name\": \"Alex\"" in prompt
+
+
+def test_mafia_count_for_players_matches_original_ratio():
+    assert mafia_count_for_players(5) == 2
+    assert mafia_count_for_players(6) == 2
+    assert mafia_count_for_players(7) == 2
+    assert mafia_count_for_players(8) == 3
+    assert mafia_count_for_players(9) == 3
+    assert mafia_count_for_players(10) == 3
+    assert mafia_count_for_players(11) == 4
+    assert mafia_count_for_players(12) == 4
+    assert mafia_count_for_players(13) == 4
+
+
+def test_mafia_public_state_reveals_factions_only_after_game_over():
+    active_snapshot = MafiaGameSnapshot(
+        game_status=MafiaGameStatus.ACTIVE,
+        phase=MafiaPhase.DAY_DISCUSSION,
+        players=[
+            MafiaPlayerRecord(participant_id="p1", display_name="Alex", is_human=True, seat_index=0, role=MafiaRole.MAFIA, faction=MafiaFaction.MAFIA),
+            MafiaPlayerRecord(participant_id="p2", display_name="Jordan", is_human=True, seat_index=1, role=MafiaRole.TOWN, faction=MafiaFaction.TOWN),
+        ],
+    )
+    active_public = active_snapshot.public_state()
+    assert [entry.faction for entry in active_public.roster] == [None, None]
+
+    game_over_snapshot = active_snapshot.model_copy(
+        update={
+            "game_status": MafiaGameStatus.GAME_OVER,
+            "winner": MafiaFaction.MAFIA,
+            "winning_participant_ids": ["p1"],
+        }
+    )
+    game_over_public = game_over_snapshot.public_state()
+    assert [entry.faction for entry in game_over_public.roster] == [MafiaFaction.MAFIA, MafiaFaction.TOWN]
+
+
+@pytest.mark.asyncio
+async def test_mafia_lobby_spinup_buffers_candidates_before_game_start(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    engine = ConversationEngine(config)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=3.0,
+    )
+    events = await engine.export_events()
+    assert engine.registry.buffer_for(config.agents[0].id)
+    assert engine.registry.buffer_for(config.agents[0].id)[0].metadata.get("mafia_lobby_spinup") is True
+    assert any(
+        logged.event.subject == "debug.event.agent.workflow.completed"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and (logged.event.payload.get("scheduler_decision") or {}).get("reason") == "mafia_lobby_spinup"
+        for logged in events
+    )
+    assert not any(
+        logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "scheduler"
+        for logged in events
+    )
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_day_discussion_phase_triggers_agent_workflow_without_waiting_for_chat(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    engine = ConversationEngine(config)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=3.0,
+    )
+    started_at = utc_now()
+    await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=MafiaGameSnapshot(
+                game_status=MafiaGameStatus.ACTIVE,
+                phase=MafiaPhase.DAY_DISCUSSION,
+                phase_started_at=started_at,
+                phase_ends_at=started_at + timedelta(seconds=45),
+                total_players=config.mafia.total_players,
+                round_no=1,
+                players=[
+                    MafiaPlayerRecord(
+                        participant_id=config.agents[0].id,
+                        display_name=config.agents[0].display_name,
+                        is_human=False,
+                        seat_index=0,
+                        role=MafiaRole.TOWN,
+                        faction=MafiaFaction.TOWN,
+                        connected=True,
+                    )
+                ],
+            ),
+        )
+    )
+    scheduler_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "scheduler"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase",
+        timeout=3.0,
+    )
+    assert scheduler_started.event.payload["command_subject"] == f"agent.workflow.{config.agents[0].id}.schedule"
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_night_reveal_spinup_prebuffers_for_next_day(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    config.agents[0].generation.staleness_window_seconds = 0.05
+    engine = ConversationEngine(config)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=3.0,
+    )
+    night_started_at = utc_now()
+    await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=MafiaGameSnapshot(
+                game_status=MafiaGameStatus.ACTIVE,
+                phase=MafiaPhase.NIGHT_REVEAL,
+                phase_started_at=night_started_at,
+                phase_ends_at=night_started_at + timedelta(seconds=45),
+                total_players=config.mafia.total_players,
+                round_no=1,
+                players=[
+                    MafiaPlayerRecord(
+                        participant_id=config.agents[0].id,
+                        display_name=config.agents[0].display_name,
+                        is_human=False,
+                        seat_index=0,
+                        role=MafiaRole.TOWN,
+                        faction=MafiaFaction.TOWN,
+                        connected=True,
+                    )
+                ],
+            ),
+        )
+    )
+    pre_day_buffered = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered"
+        and logged.event.payload.get("metadata", {}).get("mafia_pre_day_spinup") is True,
+        timeout=3.0,
+    )
+    day_started_at = utc_now()
+    await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=MafiaGameSnapshot(
+                game_status=MafiaGameStatus.ACTIVE,
+                phase=MafiaPhase.DAY_DISCUSSION,
+                phase_started_at=day_started_at,
+                phase_ends_at=day_started_at + timedelta(seconds=45),
+                total_players=config.mafia.total_players,
+                round_no=2,
+                players=[
+                    MafiaPlayerRecord(
+                        participant_id=config.agents[0].id,
+                        display_name=config.agents[0].display_name,
+                        is_human=False,
+                        seat_index=0,
+                        role=MafiaRole.TOWN,
+                        faction=MafiaFaction.TOWN,
+                        connected=True,
+                    )
+                ],
+            ),
+        )
+    )
+    scheduler_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "scheduler"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase",
+        timeout=3.0,
+    )
+    events = await engine.export_events()
+    assert pre_day_buffered.event.payload["metadata"]["mafia_pre_day_spinup"] is True
+    assert scheduler_started.event.payload["command_subject"] == f"agent.workflow.{config.agents[0].id}.schedule"
+    assert not any(
+        logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "generator"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase"
+        for logged in events
+    )
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_slow_mafia_voters_do_not_block_phase_advance(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.mode = ModeProfile.IMPROVED_BUFFERED_ASYNC
+    config.topic.enabled = False
+    config.chat.max_duration_seconds = None
+    config.chat.max_messages = None
+    config.mafia.total_players = 5
+    config.mafia.day_discussion_seconds = 0.05
+    config.mafia.day_vote_seconds = 0.05
+    config.mafia.day_reveal_seconds = 0.05
+    config.mafia.night_action_seconds = 1.0
+    config.mafia.night_reveal_seconds = 0.05
+    config.agents = generate_mafia_personas("phase-advance-timing", config.mafia.total_players)
+
+    engine = ConversationEngine(config, runtime=SlowVoterRuntime(delay_seconds=0.25))
+    await engine.start()
+    await engine.dispatch_command(
+        CommandEnvelope(
+            subject="mafia.command.game.start",
+            payload={"humans": []},
+        )
+    )
+
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "mafia.event.snapshot.updated"
+        and logged.event.payload["phase"] == MafiaPhase.DAY_VOTE.value,
+        timeout=1.0,
+    )
+    started = asyncio.get_running_loop().time()
+    revealed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "mafia.event.vote.revealed"
+        and logged.event.payload["phase"] == MafiaPhase.DAY_VOTE.value,
+        timeout=0.35,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert revealed.event.payload["summary"]
+    assert elapsed < 0.35
+    await _shutdown(engine)
 
 
 def test_scheduler_input_switches_to_listening_when_agent_rate_exceeds_average(baseline_config):
@@ -195,12 +710,44 @@ def test_scheduler_input_switches_to_listening_when_agent_rate_exceeds_average(b
     assert scheduler_input.talk_mode == "listening"
 
 
+def test_mafia_scheduler_input_allows_more_talk_before_switching_to_listening(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    agent = config.agents[0]
+    current_time = __import__("datetime").datetime.now(__import__("datetime").UTC)
+    view = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=0,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=4, avg_message_rate=1 / 4),
+        active_participant_count=4,
+        agent_message_rate=0.35,
+        avg_message_rate=1 / 4,
+        time_since_last_any=0.0,
+        time_since_last_own=0.0,
+        buffer_size=0,
+        buffer_version=0,
+        run_state="running",
+    )
+    scheduler_input = policies.scheduler_input(agent, view)
+    assert scheduler_input.talk_mode == "talkative"
+
+
 @pytest.mark.asyncio
 async def test_improved_mode_uses_transport_and_shared_conversation_boundary(improved_config):
-    engine = ConversationEngine(improved_config)
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="thai sounds good to me")
-    ack = await _wait_for_event(engine, lambda logged: logged.event.subject == "transport.event.message.acked")
+    ack = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "transport.event.message.acked",
+        timeout=3.0,
+    )
     events = await _shutdown(engine)
     committed = next(
         logged.event.payload
@@ -221,11 +768,10 @@ async def test_single_agent_cannot_accumulate_overlapping_reservations(improved_
     config.chat.typing_words_per_second = 0.5
     engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="let's pick lunch")
     first_reserved = await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".candidate.reserved"),
-        timeout=2.0,
+        timeout=3.0,
     )
     await asyncio.sleep(0.6)
     events = await engine.export_events()
@@ -301,11 +847,10 @@ async def test_agents_are_not_blocked_by_room_level_active_reservation(improved_
         agent.personality.confidence = 1.0
     engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="let's decide lunch")
     await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".candidate.reserved"),
-        timeout=2.0,
+        timeout=3.0,
     )
     await asyncio.sleep(0.4)
     events = await engine.export_events()
@@ -318,20 +863,20 @@ async def test_agents_are_not_blocked_by_room_level_active_reservation(improved_
 
 
 @pytest.mark.asyncio
-async def test_reactive_nudge_triggers_scheduler_before_coarse_tick(improved_config):
+async def test_committed_message_triggers_improved_workflow_without_periodic_polling(improved_config):
     config = improved_config.model_copy(deep=True)
     config.agents = [config.agents[0]]
     config.agents[0].scheduler.tick_rate_seconds = 5.0
     config.agents[0].generation.tick_rate_seconds = 5.0
-    config.agents[0].personality.reactivity = 1.0
     config.chat.max_duration_seconds = 3.0
     engine = ConversationEngine(config)
     await engine.start()
     await engine.submit_message(text="any lunch ideas?")
-    decided = await _wait_for_event(
+    workflow_started = await _wait_for_event(
         engine,
-        lambda logged: logged.event.subject.endswith(".scheduler.decided")
-        and logged.event.payload["agent_id"] == config.agents[0].id,
+        lambda logged: logged.event.subject == "debug.event.agent.workflow.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["trigger_kind"] == "room_message",
         timeout=1.0,
     )
     committed = next(
@@ -339,7 +884,7 @@ async def test_reactive_nudge_triggers_scheduler_before_coarse_tick(improved_con
         for logged in await engine.export_events()
         if logged.event.subject == "conversation.event.message.committed"
     )
-    assert decided.seq > committed.seq
+    assert workflow_started.seq > committed.seq
     await _shutdown(engine)
 
 
@@ -357,29 +902,42 @@ async def test_improved_mode_can_open_conversation_without_human_message(improve
         timeout=2.0,
     )
     assert opening.event.payload["sender_id"] == config.agents[0].id
+    start_debug = next(
+        logged
+        for logged in await engine.export_events()
+        if logged.event.subject == "debug.event.agent.workflow.started"
+        and logged.event.payload["trigger_kind"] == "run_start"
+    )
+    assert start_debug.event.payload["agent_id"] == config.agents[0].id
     await _shutdown(engine)
 
 
 @pytest.mark.asyncio
-async def test_improved_mode_scheduler_has_async_heartbeat_without_new_messages(improved_config):
+async def test_improved_mode_does_not_start_periodic_cognition_tasks(improved_config):
     config = improved_config.model_copy(deep=True)
     config.agents = [config.agents[0]]
-    config.agents[0].personality.talkativeness = 0.0
-    config.agents[0].personality.confidence = 0.0
-    config.agents[0].scheduler.tick_rate_seconds = 0.15
-    config.agents[0].generation.tick_rate_seconds = 0.05
-    config.chat.typing_words_per_second = 100.0
     engine = ConversationEngine(config)
     await engine.start()
-    await asyncio.sleep(0.75)
-    events = await engine.export_events()
-    scheduler_decisions = [
-        logged
-        for logged in events
-        if logged.event.subject.endswith(".scheduler.decided")
-        and logged.event.payload["agent_id"] == config.agents[0].id
-    ]
-    assert len(scheduler_decisions) >= 2
+    critical_names = set(engine._critical_tasks.values())  # noqa: SLF001
+    assert not any(name.startswith("clock.schedule.") for name in critical_names)
+    assert not any(name.startswith("clock.generate.") for name in critical_names)
+    assert not any(name.startswith("clock.topic.") for name in critical_names)
+    assert not any(name.startswith("clock.evict.") for name in critical_names)
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_improved_mode_does_not_call_scheduler_runtime_with_empty_buffer(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.agents[0].scheduler.tick_rate_seconds = 0.1
+    config.agents[0].generation.tick_rate_seconds = 10.0
+    runtime = CountingSlowGeneratorRuntime(delay_seconds=0.55)
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await asyncio.sleep(0.45)
+    assert runtime.generator_calls >= 1
+    assert runtime.scheduler_calls == 0
     await _shutdown(engine)
 
 
@@ -402,21 +960,98 @@ async def test_improved_mode_bootstrap_still_opens_with_slow_generator(improved_
 
 
 @pytest.mark.asyncio
-async def test_reactive_scheduler_coalesces_quick_messages_to_latest_context(improved_config):
+async def test_buffered_candidate_immediately_triggers_scheduler(improved_config):
     config = improved_config.model_copy(deep=True)
     config.agents = [config.agents[0]]
-    config.agents[0].scheduler.tick_rate_seconds = 5.0
-    config.agents[0].generation.tick_rate_seconds = 5.0
-    config.agents[0].personality.reactivity = 1.0
-    engine = ConversationEngine(config)
+    config.agents[0].generation.tick_rate_seconds = 10.0
+    config.agents[0].scheduler.tick_rate_seconds = 10.0
+    config.chat.typing_words_per_second = 100.0
+    runtime = CountingSlowGeneratorRuntime(delay_seconds=0.2)
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    opening = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["sender_kind"] == "agent",
+        timeout=2.0,
+    )
+    assert opening.event.payload["sender_id"] == config.agents[0].id
+    assert runtime.scheduler_calls >= 1
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_slow_analyzer_does_not_block_generator_or_scheduler(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config, runtime=SlowAnalyzerRuntime(delay_seconds=0.5))
+    await engine.start()
+    generator_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["worker_kind"] == "generator",
+        timeout=0.5,
+    )
+    scheduler_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["worker_kind"] == "scheduler",
+        timeout=1.0,
+    )
+    analyzer_completed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.completed"
+        and logged.event.payload["worker_kind"] == "analyzer",
+        timeout=2.0,
+    )
+    assert generator_started.seq < analyzer_completed.seq
+    assert scheduler_started.seq < analyzer_completed.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_workflow_completion_is_not_blocked_by_slow_analyzer(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config, runtime=SlowAnalyzerRuntime(delay_seconds=0.5))
+    await engine.start()
+    workflow_completed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.workflow.completed"
+        and logged.event.payload["agent_id"] == config.agents[0].id,
+        timeout=1.5,
+    )
+    analyzer_completed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.completed"
+        and logged.event.payload["worker_kind"] == "analyzer",
+        timeout=2.0,
+    )
+    assert workflow_completed.seq < analyzer_completed.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_workflow_coalesces_quick_messages_to_latest_context(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    engine = ConversationEngine(config, runtime=SlowGeneratorRuntime(delay_seconds=0.2))
     await engine.start()
     await engine.submit_message(text="what should we eat?")
     await engine.submit_message(text="maybe thai or sushi")
+    coalesced = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.workflow.coalesced"
+        and logged.event.payload["agent_id"] == config.agents[0].id,
+        timeout=1.5,
+    )
     decided = await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".scheduler.decided")
         and logged.event.payload["agent_id"] == config.agents[0].id,
-        timeout=1.5,
+        timeout=2.5,
     )
     committed = [
         logged
@@ -424,18 +1059,21 @@ async def test_reactive_scheduler_coalesces_quick_messages_to_latest_context(imp
         if logged.event.subject == "conversation.event.message.committed"
     ]
     assert len(committed) >= 2
-    latest_committed = committed[-1]
-    assert decided.event.payload["source_watermark"] >= latest_committed.seq
+    latest_human_committed = next(
+        logged
+        for logged in reversed(committed)
+        if logged.event.payload["sender_kind"] == "human"
+    )
+    assert coalesced.event.payload["trigger_kind"] == "room_message"
+    assert coalesced.event.payload["rerun_pending"] is True
+    assert decided.event.payload["source_watermark"] >= latest_human_committed.seq
     await _shutdown(engine)
 
 
 @pytest.mark.asyncio
-async def test_reactive_send_path_survives_slow_generator_projection_lag(improved_config):
+async def test_workflow_send_path_survives_slow_generator_projection_lag(improved_config):
     config = improved_config.model_copy(deep=True)
     config.agents = [config.agents[0]]
-    config.agents[0].scheduler.tick_rate_seconds = 5.0
-    config.agents[0].generation.tick_rate_seconds = 5.0
-    config.agents[0].personality.reactivity = 1.0
     config.chat.typing_words_per_second = 100.0
     engine = ConversationEngine(config, runtime=SlowGeneratorRuntime(delay_seconds=0.35))
     await engine.start()
@@ -451,17 +1089,101 @@ async def test_reactive_send_path_survives_slow_generator_projection_lag(improve
 
 
 @pytest.mark.asyncio
+async def test_improved_mode_regenerates_fresh_candidate_if_scheduler_latency_makes_buffer_stale(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    config.agents[0].generation.staleness_window_seconds = 0.05
+    engine = ConversationEngine(config, runtime=SlowSchedulerRuntime(delay_seconds=0.12))
+    await engine.start()
+    reply = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["sender_kind"] == "agent",
+        timeout=3.0,
+    )
+    discarded = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject.endswith(".candidate.discarded")
+        and logged.event.payload["reason"] == "stale_before_send",
+        timeout=3.0,
+    )
+    assert discarded.seq < reply.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_improved_mode_follow_up_reconsideration_can_send_after_initial_wait(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config)
+    await engine.start()
+    await engine.submit_message(text="thai sounds good to me")
+    reply = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["sender_kind"] == "agent",
+        timeout=3.0,
+    )
+    follow_up = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.workflow.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["trigger_kind"] == "follow_up",
+        timeout=3.0,
+    )
+    assert follow_up.seq < reply.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_self_authored_committed_message_does_not_trigger_immediate_self_reply(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config)
+    await engine.start()
+    first_reply = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["sender_kind"] == "agent",
+        timeout=2.0,
+    )
+    skipped = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.workflow.skipped"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["reason"] == "self_message",
+        timeout=1.0,
+    )
+    assert skipped.seq > first_reply.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
 async def test_analyzer_uses_committed_messages_only_and_topic_ids_persist(improved_config):
     engine = ConversationEngine(improved_config)
     await engine.start()
     await engine.submit_message(text="lunch thai budget")
+    committed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["text"] == "lunch thai budget",
+    )
     first = await _wait_for_event(
         engine,
-        lambda logged: logged.event.subject == "topic.event.alex.snapshot.updated",
+        lambda logged: logged.event.subject == "topic.event.alex.snapshot.updated"
+        and logged.event.payload["watermark"] >= committed.seq
+        and logged.event.payload["dominant_topic_id"] is not None,
     )
+    await engine.submit_message(text="thai lunch still sounds budget friendly")
     second = await _wait_for_event(
         engine,
-        lambda logged: logged.event.subject == "topic.event.alex.snapshot.updated" and logged.seq > first.seq,
+        lambda logged: logged.event.subject == "topic.event.alex.snapshot.updated"
+        and logged.seq > first.seq
+        and logged.event.payload["watermark"] > first.event.payload["watermark"]
+        and logged.event.payload["dominant_topic_id"] is not None,
         timeout=3.5,
     )
     events = await _shutdown(engine)
@@ -476,33 +1198,26 @@ async def test_analyzer_uses_committed_messages_only_and_topic_ids_persist(impro
 
 
 @pytest.mark.asyncio
-async def test_pause_freezes_scheduled_delivery_until_resume(improved_config):
+async def test_immediate_delivery_submits_without_waiting_for_clock(improved_config):
     config = improved_config.model_copy(deep=True)
-    config.chat.typing_words_per_second = 1.5
     config.chat.max_duration_seconds = 6.0
+    config.agents = [config.agents[0]]
     engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="thai sounds good")
     scheduled = await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".delivery.scheduled"),
+        timeout=3.0,
     )
     reservation_id = scheduled.event.payload["reservation_id"]
-    await engine.dispatch_command(CommandEnvelope(subject="run.command.pause"))
-    await asyncio.sleep(0.5)
-    paused_events = await engine.export_events()
-    assert not any(
-        logged.event.subject.endswith(".delivery.submitted")
-        and logged.event.payload["reservation_id"] == reservation_id
-        for logged in paused_events
-    )
-    await engine.dispatch_command(CommandEnvelope(subject="run.command.resume"))
-    await _wait_for_event(
+    assert scheduled.event.payload["delay_seconds"] == 0.0
+    submitted = await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".delivery.submitted")
         and logged.event.payload["reservation_id"] == reservation_id,
-        timeout=4.0,
+        timeout=1.0,
     )
+    assert submitted.seq > scheduled.seq
     await _shutdown(engine)
 
 
@@ -547,13 +1262,14 @@ async def test_retryable_transport_failure_requeues_candidate(improved_config):
     register_transport(provider, lambda engine, config: RetryableFailTransport(engine, config))
     config = improved_config.model_copy(deep=True)
     config.transport.provider = provider
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
     engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="pizza maybe")
     requeued = await _wait_for_event(
         engine,
         lambda logged: logged.event.subject.endswith(".candidate.requeued"),
-        timeout=2.0,
+        timeout=3.0,
     )
     assert engine.registry.buffer_for(requeued.event.payload["candidate"]["agent_id"])
     await _shutdown(engine)
@@ -561,14 +1277,20 @@ async def test_retryable_transport_failure_requeues_candidate(improved_config):
 
 @pytest.mark.asyncio
 async def test_replay_reconstructs_projection_state_without_rerunning_inference(improved_config):
-    engine = ConversationEngine(improved_config)
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    config.chat.typing_words_per_second = 100.0
+    engine = ConversationEngine(config)
     await engine.start()
-    await engine.submit_message(text="sushi?")
-    await _wait_for_event(engine, lambda logged: logged.event.subject == "transport.event.message.acked")
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "transport.event.message.acked",
+        timeout=3.0,
+    )
     original_events = await _shutdown(engine)
 
     replay_log = EventLog()
-    replay_registry = ProjectionRegistry(replay_log, improved_config)
+    replay_registry = ProjectionRegistry(replay_log, config)
     await replay_registry.start()
     for logged in original_events:
         await replay_log.append(logged.event)
@@ -663,6 +1385,30 @@ async def test_agent_call_debug_events_capture_scheduler_and_generator(improved_
     assert "decision" in scheduler["output_summary"]
     assert "focus_preview" in generator["input_summary"]
     assert "text" in generator["output_summary"]
+
+
+@pytest.mark.asyncio
+async def test_agents_use_distinct_session_keys_and_workspaces(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = config.agents[:2]
+    runtime = RecordingRuntime()
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["worker_kind"] == "generator"
+        and logged.event.payload["agent_id"] == config.agents[1].id,
+        timeout=2.0,
+    )
+    generator_calls = [(agent_id, role_name, session_key, workspace_path) for agent_id, role_name, session_key, workspace_path in runtime.calls if role_name == "generator"]
+    assert len(generator_calls) >= 2
+    session_keys = {session_key for _, _, session_key, _ in generator_calls}
+    workspace_paths = {workspace_path for _, _, _, workspace_path in generator_calls}
+    assert len(session_keys) >= 2
+    assert len(workspace_paths) >= 2
+    assert all("participant:" in session_key for session_key in session_keys if session_key)
+    await _shutdown(engine)
 
 
 @pytest.mark.asyncio

@@ -9,9 +9,15 @@ class ModeProfile(StrEnum):
     IMPROVED_BUFFERED_ASYNC = "improved.buffered_async"
 
 
+class RoomMode(StrEnum):
+    REGULAR = "regular"
+    MAFIA = "mafia"
+
+
 class RuntimeConfig(BaseModel):
     provider: str = "claude"
     model: str = "claude-haiku-4-5-20251001"
+    max_concurrency: int | None = Field(default=None, ge=1)
 
 
 class TransportConfig(BaseModel):
@@ -40,6 +46,15 @@ class TopicConfig(BaseModel):
     tick_rate_seconds: float = 3.0
     stale_after_seconds: float = 10.0
     max_topics: int = 3
+
+
+class MafiaConfig(BaseModel):
+    total_players: int = Field(default=6, ge=5, le=13)
+    day_discussion_seconds: float = 270.0
+    day_vote_seconds: float = 90.0
+    day_reveal_seconds: float = 30.0
+    night_action_seconds: float = 90.0
+    night_reveal_seconds: float = 30.0
 
 
 class ContextConfig(BaseModel):
@@ -81,12 +96,14 @@ class PolicyProfile(BaseModel):
 
 
 class AppConfig(BaseModel):
+    room_mode: RoomMode = RoomMode.REGULAR
     mode: ModeProfile = ModeProfile.BASELINE_TIME_TO_TALK
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     chat: ChatConfig
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     topic: TopicConfig = Field(default_factory=TopicConfig)
+    mafia: MafiaConfig = Field(default_factory=MafiaConfig)
     context_defaults: ContextConfig = Field(default_factory=ContextConfig)
     agents: list[AgentConfig]
 

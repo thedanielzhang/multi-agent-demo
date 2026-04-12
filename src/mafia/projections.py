@@ -9,6 +9,9 @@ from mafia.context import ContextAssembler, entropy_from_keywords, keyword_sketc
 from mafia.event_log import EventLog
 from mafia.messages import (
     AgentContextSnapshot,
+    MafiaGameSnapshot,
+    MafiaPrivateState,
+    MafiaPublicState,
     AgentTopicSnapshot,
     CandidateRecord,
     ConversationMessage,
@@ -163,10 +166,30 @@ class AgentTopicProjection:
         self.snapshots: dict[str, AgentTopicSnapshot] = {}
 
     def apply(self, logged_event: LoggedEvent) -> None:
-        if ".snapshot.updated" not in logged_event.event.subject:
+        if not logged_event.event.subject.startswith("topic.event.") or not logged_event.event.subject.endswith(".snapshot.updated"):
             return
         snapshot = AgentTopicSnapshot.model_validate(logged_event.event.payload)
         self.snapshots[snapshot.agent_id] = snapshot
+
+
+class MafiaProjection:
+    def __init__(self) -> None:
+        self.snapshot: MafiaGameSnapshot | None = None
+
+    def public_state(self) -> MafiaPublicState | None:
+        if self.snapshot is None:
+            return None
+        return self.snapshot.public_state()
+
+    def private_state_for(self, participant_id: str) -> MafiaPrivateState | None:
+        if self.snapshot is None:
+            return None
+        return self.snapshot.private_state_for(participant_id)
+
+    def apply(self, logged_event: LoggedEvent) -> None:
+        if logged_event.event.subject != "mafia.event.snapshot.updated":
+            return
+        self.snapshot = MafiaGameSnapshot.model_validate(logged_event.event.payload)
 
 
 class RoomMetricsProjection:
@@ -228,6 +251,7 @@ class ProjectionRegistry:
         self._buffers = CandidateBufferProjection()
         self._reservations = ReservationProjection()
         self._topics = AgentTopicProjection()
+        self._mafia = MafiaProjection()
         self._room_metrics = RoomMetricsProjection()
         self._watermark = 0
         self._condition = asyncio.Condition()
@@ -311,6 +335,18 @@ class ProjectionRegistry:
         snapshot = self._topics.snapshots.get(agent_id)
         return snapshot.model_copy(deep=True) if snapshot else None
 
+    def mafia_snapshot(self) -> MafiaGameSnapshot | None:
+        snapshot = self._mafia.snapshot
+        return snapshot.model_copy(deep=True) if snapshot else None
+
+    def mafia_public_state(self) -> MafiaPublicState | None:
+        snapshot = self._mafia.public_state()
+        return snapshot.model_copy(deep=True) if snapshot else None
+
+    def mafia_private_state_for(self, participant_id: str) -> MafiaPrivateState | None:
+        snapshot = self._mafia.private_state_for(participant_id)
+        return snapshot.model_copy(deep=True) if snapshot else None
+
     async def _run(self) -> None:
         seq = 0
         while True:
@@ -321,6 +357,7 @@ class ProjectionRegistry:
                 self._buffers.apply(logged_event)
                 self._reservations.apply(logged_event)
                 self._topics.apply(logged_event)
+                self._mafia.apply(logged_event)
                 self._room_metrics.apply(logged_event, self._timeline)
                 self._watermark = logged_event.seq
                 seq = logged_event.seq

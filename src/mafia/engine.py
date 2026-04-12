@@ -5,6 +5,7 @@ import contextlib
 import json
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,6 +16,7 @@ from mafia.command_router import CommandRouter
 from mafia.compose_compat import AgentRuntime
 from mafia.config import AgentConfig, AppConfig, ModeProfile
 from mafia.event_log import EventLog
+from mafia.mafia_controller import MafiaGameController
 from mafia.messages import (
     CommandEnvelope,
     ConversationMessage,
@@ -34,6 +36,8 @@ from mafia.workers import (
     AgentBufferWorker,
     AgentDeliveryWorker,
     AgentGenerationWorker,
+    ImprovedAgentWorkflowRunner,
+    MafiaVoteWorker,
     AgentSchedulerWorker,
     AgentTopicAnalyzerWorker,
 )
@@ -64,7 +68,7 @@ class EventDispatcher:
             events = await self._event_log.wait_for_events(seq)
             for logged_event in events:
                 await self._registry.wait_until(logged_event.seq)
-                await self._bus.publish(logged_event.event.subject, logged_event.event)
+                await self._bus.publish(logged_event.event.subject, logged_event)
                 seq = logged_event.seq
 
 
@@ -94,41 +98,6 @@ class ClockService:
                         f"agent.command.{agent.id}.schedule.tick",
                         agent.scheduler.tick_rate_seconds,
                         initial_delay=base_stagger,
-                    ),
-                )
-            if self._config.mode == ModeProfile.IMPROVED_BUFFERED_ASYNC:
-                self._spawn(
-                    f"clock.schedule.{agent.id}",
-                    self._jittered_periodic(
-                        f"agent.command.{agent.id}.schedule.tick",
-                        agent.scheduler.tick_rate_seconds,
-                        initial_delay=base_stagger + 0.22,
-                        phase=index,
-                        payload={"heartbeat": True},
-                    ),
-                )
-                self._spawn(
-                    f"clock.generate.{agent.id}",
-                    self._periodic(
-                        f"agent.command.{agent.id}.generate.tick",
-                        agent.generation.tick_rate_seconds,
-                        initial_delay=base_stagger + 0.05,
-                    ),
-                )
-                self._spawn(
-                    f"clock.topic.{agent.id}",
-                    self._periodic(
-                        f"topic.command.{agent.id}.analyze.tick",
-                        self._config.topic.tick_rate_seconds,
-                        initial_delay=base_stagger + 0.08,
-                    ),
-                )
-                self._spawn(
-                    f"clock.evict.{agent.id}",
-                    self._periodic(
-                        f"agent.command.{agent.id}.buffer.evict.tick",
-                        min(agent.generation.tick_rate_seconds, 0.5),
-                        initial_delay=base_stagger + 0.03,
                     ),
                 )
 
@@ -182,34 +151,6 @@ class ClockService:
             if self._registry.run_state() != "running":
                 continue
             await self._command_router.enqueue(CommandEnvelope(subject=subject))
-
-    async def _jittered_periodic(
-        self,
-        subject: str,
-        interval: float,
-        *,
-        initial_delay: float = 0.0,
-        phase: int = 0,
-        payload: dict[str, object] | None = None,
-    ) -> None:
-        beat = 0
-        if initial_delay > 0:
-            await self._sleep_resumable(initial_delay)
-        while not self._stop_event.is_set():
-            factor = self._heartbeat_factor(phase, beat)
-            await self._sleep_resumable(max(0.05, interval * factor))
-            if self._stop_event.is_set():
-                return
-            if self._registry.run_state() != "running":
-                continue
-            await self._command_router.enqueue(
-                CommandEnvelope(subject=subject, payload=dict(payload or {}))
-            )
-            beat += 1
-
-    def _heartbeat_factor(self, phase: int, beat: int) -> float:
-        factors = (0.82, 1.07, 0.91, 1.16, 0.97, 1.11)
-        return factors[(phase + beat) % len(factors)]
 
     async def _one_shot(self, delay_seconds: float, command: CommandEnvelope) -> None:
         await self._sleep_resumable(delay_seconds)
@@ -280,13 +221,11 @@ class ConversationEngine:
         self._critical_tasks: dict[asyncio.Task[Any], str] = {}
         self._handling_failure = False
         self._transport = build_transport(self, config.transport)
-        self._reactive_mailboxes: dict[str, asyncio.Queue[ConversationMessage]] = {
-            agent.id: asyncio.Queue(maxsize=32) for agent in config.agents
-        }
-        self._reactive_tasks: dict[str, asyncio.Task[None]] = {}
-        self._bootstrap_tasks: list[asyncio.Task[None]] = []
+        self._agent_workers: dict[str, AgentWorkers] = {}
+        self._workflow_runners: dict[str, ImprovedAgentWorkflowRunner] = {}
+        self._mafia = MafiaGameController(self) if config.room_mode.value == "mafia" else None
         self._register_handlers()
-        self._register_reactive_subscriptions()
+        self._register_workflow_subscriptions()
 
     async def start(self) -> None:
         if self._tasks_started:
@@ -302,11 +241,8 @@ class ConversationEngine:
         if self.dispatcher.task:
             self._monitor_task(self.dispatcher.task, "dispatcher")
         await self.clock.start(self._monitor_task)
-        await self._start_reactive_reactors()
         await self.dispatch_command(CommandEnvelope(subject="run.command.start"))
         await self._wait_for_state("running")
-        if self.config.mode == ModeProfile.IMPROVED_BUFFERED_ASYNC:
-            await self._bootstrap_improved_agents()
 
     async def run(self) -> None:
         await self.start()
@@ -322,12 +258,10 @@ class ConversationEngine:
             with contextlib.suppress(Exception):
                 await self._wait_for_state("stopped", timeout=2.0)
         self._closed = True
-        for task in self._reactive_tasks.values():
-            task.cancel()
-        for task in self._bootstrap_tasks:
-            task.cancel()
-        await asyncio.gather(*self._bootstrap_tasks, return_exceptions=True)
-        await asyncio.gather(*self._reactive_tasks.values(), return_exceptions=True)
+        await asyncio.gather(
+            *(runner.close() for runner in self._workflow_runners.values()),
+            return_exceptions=True,
+        )
         await self.clock.close()
         await self.command_router.close()
         await self.dispatcher.close()
@@ -423,6 +357,11 @@ class ConversationEngine:
         self._critical_tasks[task] = name
         task.add_done_callback(self._task_done)
 
+    def create_background_task(self, coro, name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        self._monitor_task(task, name)
+        return task
+
     def _task_done(self, task: asyncio.Task[Any]) -> None:
         name = self._critical_tasks.pop(task, "unknown")
         if task.cancelled():
@@ -473,6 +412,10 @@ class ConversationEngine:
         self.command_router.register("run.command.export", self._handle_export)
         self.command_router.register("conversation.command.message.submit", self._handle_submit_message)
         self.command_router.register("transport.command.message.send", self._transport.handle_send)
+        if self._mafia is not None:
+            self.command_router.register("mafia.command.game.start", self._handle_mafia_start_game)
+            self.command_router.register("mafia.command.phase.advance", self._handle_mafia_advance_phase)
+            self.command_router.register("mafia.command.vote.cast", self._handle_mafia_cast_vote)
 
         for agent in self.config.agents:
             actors = self._agent_actors[agent.id]
@@ -480,15 +423,34 @@ class ConversationEngine:
             generator = AgentGenerationWorker(self, self.config, agent, actors, self.invoker, self.policies)
             buffer_worker = AgentBufferWorker(self, self.config, agent, actors, self.invoker, self.policies)
             scheduler = AgentSchedulerWorker(self, self.config, agent, actors, self.invoker, self.policies)
+            voter = MafiaVoteWorker(self, self.config, agent, actors, self.invoker, self.policies)
             delivery = AgentDeliveryWorker(self, self.config, agent)
-            self.command_router.register(f"topic.command.{agent.id}.analyze.tick", analyzer.handle_tick)
-            self.command_router.register(f"agent.command.{agent.id}.generate.tick", generator.handle_tick)
-            self.command_router.register(f"agent.command.{agent.id}.buffer.evict.tick", buffer_worker.handle_evict_tick)
-            self.command_router.register(f"agent.command.{agent.id}.schedule.tick", scheduler.handle_tick)
+            self._agent_workers[agent.id] = AgentWorkers(
+                analyzer=analyzer,
+                generator=generator,
+                buffer_worker=buffer_worker,
+                scheduler=scheduler,
+                voter=voter,
+                delivery=delivery,
+            )
+            if self.config.mode == ModeProfile.BASELINE_TIME_TO_TALK:
+                self.command_router.register(f"agent.command.{agent.id}.schedule.tick", scheduler.handle_tick)
+            else:
+                self._workflow_runners[agent.id] = ImprovedAgentWorkflowRunner(
+                    self,
+                    self.config,
+                    agent,
+                    analyzer,
+                    generator,
+                    buffer_worker,
+                    scheduler,
+                )
             self.command_router.register(f"agent.command.{agent.id}.deliver.request", delivery.handle_request)
             self.command_router.register(f"agent.command.{agent.id}.deliver.submit", delivery.handle_submit)
             self.command_router.register(f"agent.command.{agent.id}.delivery.transport_acked", delivery.handle_transport_acked)
             self.command_router.register(f"agent.command.{agent.id}.delivery.transport_failed", delivery.handle_transport_failed)
+            if self._mafia is not None:
+                self.command_router.register(f"agent.command.{agent.id}.mafia.vote", voter.handle_vote)
 
     async def _set_state(self, state: str, command: CommandEnvelope | None = None, **payload: Any) -> None:
         logged = await self.append_event(
@@ -523,6 +485,8 @@ class ConversationEngine:
         )
         await self._set_state("starting", command)
         await self._set_state("running", command)
+        if self._mafia is not None:
+            await self._mafia.initialize_lobby(command)
 
     async def _handle_pause(self, command: CommandEnvelope) -> None:
         if self.registry.run_state() == "running":
@@ -589,248 +553,76 @@ class ConversationEngine:
         )
         await self.registry.wait_until(logged.seq)
 
-    def _register_reactive_subscriptions(self) -> None:
+    async def _handle_mafia_start_game(self, command: CommandEnvelope) -> None:
+        if self._mafia is None:
+            return
+        humans = list(command.payload.get("humans") or [])
+        await self._mafia.start_game(humans, command=command)
+
+    async def _handle_mafia_advance_phase(self, command: CommandEnvelope) -> None:
+        if self._mafia is None:
+            return
+        snapshot = self.registry.mafia_snapshot()
+        if snapshot is None:
+            return
+        expected_phase = command.payload.get("expected_phase")
+        expected_round = command.payload.get("round_no")
+        if expected_phase and snapshot.phase.value != expected_phase:
+            return
+        if expected_round is not None and snapshot.round_no != expected_round:
+            return
+        await self._mafia.advance_phase(command=command)
+
+    async def _handle_mafia_cast_vote(self, command: CommandEnvelope) -> None:
+        if self._mafia is None:
+            return
+        participant_id = str(command.payload.get("participant_id") or "").strip()
+        if not participant_id:
+            return
+        target = command.payload.get("target_participant_id")
+        target = str(target).strip() if target is not None else None
+        await self._mafia.cast_vote(participant_id, target, command=command)
+
+    def _register_workflow_subscriptions(self) -> None:
         if self.config.mode != ModeProfile.IMPROVED_BUFFERED_ASYNC:
             return
-        for index, agent in enumerate(self.config.agents):
+        for agent in self.config.agents:
+            runner = self._workflow_runners[agent.id]
             self.bus.subscribe(
                 "conversation.event.message.committed",
-                self._make_agent_reactive_handler(agent, index=index),
+                self._make_workflow_handler(runner),
                 maxsize=128,
                 overflow="drop_oldest",
             )
+            self.bus.subscribe(
+                "run.event.state.changed",
+                self._make_workflow_handler(runner),
+                maxsize=32,
+                overflow="drop_oldest",
+            )
+            if self.config.room_mode.value == "mafia":
+                self.bus.subscribe(
+                    "mafia.event.snapshot.updated",
+                    self._make_workflow_handler(runner),
+                    maxsize=64,
+                    overflow="drop_oldest",
+                )
 
-    def _make_agent_reactive_handler(self, agent: AgentConfig, *, index: int):
-        async def _handle(_subject: str, event: EventEnvelope) -> None:
-            await self._handle_committed_message_reactive_nudge_for_agent(agent, index=index, event=event)
+    def _make_workflow_handler(self, runner: ImprovedAgentWorkflowRunner):
+        async def _handle(_subject: str, logged_event: LoggedEvent) -> None:
+            await runner.on_logged_event(logged_event)
 
         return _handle
 
-    async def _start_reactive_reactors(self) -> None:
-        if self.config.mode != ModeProfile.IMPROVED_BUFFERED_ASYNC:
-            return
-        for index, agent in enumerate(self.config.agents):
-            if agent.id in self._reactive_tasks:
-                continue
-            task = asyncio.create_task(self._reactive_agent_loop(agent, index=index))
-            self._reactive_tasks[agent.id] = task
-            self._monitor_task(task, f"reactive-agent.{agent.id}")
 
-    async def _handle_committed_message_reactive_nudge_for_agent(
-        self,
-        agent: AgentConfig,
-        *,
-        index: int,
-        event: EventEnvelope,
-    ) -> None:
-        message = ConversationMessage.model_validate(event.payload)
-        queue = self._reactive_mailboxes[agent.id]
-        if queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
-                queue.task_done()
-        await queue.put(message)
-
-    async def _bootstrap_improved_agents(self) -> None:
-        for index, agent in enumerate(self.config.agents):
-            task = asyncio.create_task(self._bootstrap_agent(agent, index=index))
-            self._bootstrap_tasks.append(task)
-            self._monitor_task(task, f"bootstrap.{agent.id}")
-
-    async def _bootstrap_agent(self, agent: AgentConfig, *, index: int) -> None:
-        await asyncio.sleep(0.05 + (0.12 * index))
-        if self.registry.run_state() != "running":
-            return
-        previous_buffer_version = self.registry.buffer_version_for(agent.id)
-        await self.dispatch_command(
-            CommandEnvelope(
-                subject=f"agent.command.{agent.id}.generate.tick",
-                payload={"bootstrap": True},
-            )
-        )
-        await self._wait_for_buffer_update(agent.id, previous_version=previous_buffer_version, timeout=0.5)
-        if self.registry.run_state() != "running":
-            return
-        if self.registry.active_reservation_for(agent.id) is not None:
-            return
-        if not self.registry.buffer_for(agent.id):
-            return
-        await self.dispatch_command(
-            CommandEnvelope(
-                subject=f"agent.command.{agent.id}.schedule.tick",
-                payload={"bootstrap": True},
-            )
-        )
-
-    def _reactive_schedule_delay(self, agent: AgentConfig, *, index: int) -> float:
-        base = min(
-            agent.scheduler.tick_rate_seconds * 0.6,
-            0.06 + ((1.0 - agent.personality.reactivity) * 0.45),
-        )
-        persona_offset = (index % 5) * 0.015
-        return min(agent.scheduler.tick_rate_seconds, max(0.04, base + persona_offset))
-
-    def _reactive_follow_up_delay(self, agent: AgentConfig, *, index: int, attempt: int) -> float:
-        base = max(
-            0.16,
-            min(agent.scheduler.tick_rate_seconds * 4.0, self._reactive_schedule_delay(agent, index=index) * 1.2),
-        )
-        return min(agent.scheduler.tick_rate_seconds * 6.0, base + (attempt * 0.14))
-
-    def _reactive_follow_up_attempts(self, agent: AgentConfig) -> int:
-        return max(1, min(3, 1 + round(agent.personality.reactivity * 2)))
-
-    async def _reactive_agent_loop(self, agent: AgentConfig, *, index: int) -> None:
-        queue = self._reactive_mailboxes[agent.id]
-        while True:
-            pending = await queue.get()
-            queue.task_done()
-            pending = await self._coalesce_reactive_messages(agent, index=index, queue=queue, pending=pending)
-            if pending.sender_id == agent.id:
-                continue
-            while True:
-                if self.registry.run_state() != "running":
-                    break
-                if self.registry.active_reservation_for(agent.id) is not None:
-                    newer = await self._wait_for_reactive_message(queue, timeout=0.05)
-                    if newer is None:
-                        continue
-                    if newer.sender_id == agent.id:
-                        continue
-                    pending = await self._coalesce_reactive_messages(
-                        agent,
-                        index=index,
-                        queue=queue,
-                        pending=newer,
-                    )
-                    continue
-                should_retry = await self._run_reactive_attempt(agent, pending)
-                if not should_retry:
-                    break
-                restarted = False
-                for attempt in range(self._reactive_follow_up_attempts(agent)):
-                    newer = await self._wait_for_reactive_message(
-                        queue,
-                        timeout=self._reactive_follow_up_delay(agent, index=index, attempt=attempt),
-                    )
-                    if newer is not None:
-                        pending = await self._coalesce_reactive_messages(
-                            agent,
-                            index=index,
-                            queue=queue,
-                            pending=newer,
-                        )
-                        restarted = True
-                        break
-                    if self.registry.run_state() != "running":
-                        break
-                    if self.registry.active_reservation_for(agent.id) is not None:
-                        break
-                    should_retry = await self._run_reactive_attempt(
-                        agent,
-                        pending,
-                        follow_up=attempt + 1,
-                    )
-                    if not should_retry:
-                        break
-                if restarted:
-                    continue
-                break
-
-    async def _run_reactive_attempt(
-        self,
-        agent: AgentConfig,
-        pending: ConversationMessage,
-        *,
-        follow_up: int = 0,
-    ) -> bool:
-        reactive_payload = {
-            "reactive": True,
-            "message_id": pending.message_id,
-        }
-        if follow_up:
-            reactive_payload["follow_up"] = follow_up
-        await self.dispatch_command(
-            CommandEnvelope(
-                subject=f"agent.command.{agent.id}.generate.tick",
-                payload=reactive_payload,
-            )
-        )
-        newer = self._drain_latest_reactive_message(self._reactive_mailboxes[agent.id], agent_id=agent.id)
-        if newer is not None:
-            await self._reactive_mailboxes[agent.id].put(newer)
-            return True
-        if self.registry.active_reservation_for(agent.id) is not None:
-            return False
-        await self.dispatch_command(
-            CommandEnvelope(
-                subject=f"agent.command.{agent.id}.schedule.tick",
-                payload=reactive_payload,
-            )
-        )
-        return self.registry.run_state() == "running" and self.registry.active_reservation_for(agent.id) is None
-
-    async def _coalesce_reactive_messages(
-        self,
-        agent: AgentConfig,
-        *,
-        index: int,
-        queue: asyncio.Queue[ConversationMessage],
-        pending: ConversationMessage,
-    ) -> ConversationMessage:
-        delay = self._reactive_schedule_delay(agent, index=index)
-        while True:
-            newer = await self._wait_for_reactive_message(queue, timeout=delay)
-            if newer is None:
-                return pending
-            if newer.sender_id == agent.id:
-                continue
-            pending = newer
-
-    async def _wait_for_reactive_message(
-        self,
-        queue: asyncio.Queue[ConversationMessage],
-        *,
-        timeout: float,
-    ) -> ConversationMessage | None:
-        try:
-            message = await asyncio.wait_for(queue.get(), timeout=timeout)
-        except TimeoutError:
-            return None
-        queue.task_done()
-        return message
-
-    def _drain_latest_reactive_message(
-        self,
-        queue: asyncio.Queue[ConversationMessage],
-        *,
-        agent_id: str,
-    ) -> ConversationMessage | None:
-        latest: ConversationMessage | None = None
-        while True:
-            with contextlib.suppress(asyncio.QueueEmpty):
-                message = queue.get_nowait()
-                queue.task_done()
-                if message.sender_id != agent_id:
-                    latest = message
-                continue
-            return latest
-
-    async def _wait_for_buffer_update(
-        self,
-        agent_id: str,
-        *,
-        previous_version: int,
-        timeout: float,
-    ) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.registry.run_state() != "running":
-                return False
-            if self.registry.buffer_version_for(agent_id) > previous_version:
-                return True
-            await asyncio.sleep(0.01)
-        return self.registry.buffer_version_for(agent_id) > previous_version
+@dataclass(slots=True)
+class AgentWorkers:
+    analyzer: AgentTopicAnalyzerWorker
+    generator: AgentGenerationWorker
+    buffer_worker: AgentBufferWorker
+    scheduler: AgentSchedulerWorker
+    voter: MafiaVoteWorker
+    delivery: AgentDeliveryWorker
 
 
 def load_config(path: Path) -> AppConfig:

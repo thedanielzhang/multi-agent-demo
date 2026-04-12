@@ -9,6 +9,8 @@ from mafia.messages import (
     AnalyzerReply,
     GeneratorInputSnapshot,
     GeneratorReply,
+    MafiaVoteInputSnapshot,
+    MafiaVoteReply,
     SchedulerInputSnapshot,
     SchedulerReply,
     TopicSummary,
@@ -33,20 +35,20 @@ class ScriptedAgentLogic:
         if context.room_is_idle and snapshot.has_buffered_candidate:
             opening_pressure = talkativeness + (confidence * 0.3)
             return SchedulerReply(
-                decision="send" if opening_pressure >= 0.45 else "wait",
-                reason="room-opening" if opening_pressure >= 0.45 else "room-idle-wait",
+                decision="send" if opening_pressure >= 0.35 else "wait",
+                reason="room-opening" if opening_pressure >= 0.35 else "room-idle-wait",
             )
-        if context.has_sent_message and context.time_since_last_own < max(0.5, 2.0 - talkativeness):
+        if context.has_sent_message and context.time_since_last_own < max(0.12, 0.72 - (talkativeness * 0.45)):
             return SchedulerReply(decision="wait", reason="recent-own-message")
-        if context.time_since_last_any < max(0.2, 1.0 - reactivity):
+        if context.time_since_last_any < max(0.04, 0.24 - (reactivity * 0.1)):
             return SchedulerReply(decision="wait", reason="conversation-active")
         if (
             snapshot.has_buffered_candidate
-            and snapshot.candidate_similarity_score >= 0.74
-            and (snapshot.similar_recent_message_age_seconds or 999.0) <= 8.0
+            and snapshot.candidate_similarity_score >= 0.96
+            and (snapshot.similar_recent_message_age_seconds or 999.0) <= 4.0
         ):
             return SchedulerReply(decision="wait", reason="duplicate-recent-message")
-        if snapshot.has_buffered_candidate and snapshot.inflight_similarity_score >= 0.78:
+        if snapshot.has_buffered_candidate and snapshot.inflight_similarity_score >= 0.97:
             return SchedulerReply(decision="wait", reason="duplicate-inflight-message")
 
         baseline_pressure = talkativeness + (confidence * 0.25)
@@ -56,11 +58,11 @@ class ScriptedAgentLogic:
 
         if snapshot.has_buffered_candidate and context.buffer_size > 0:
             return SchedulerReply(
-                decision="send" if buffered_pressure >= 0.4 else "wait",
+                decision="send" if buffered_pressure >= 0.28 else "wait",
                 reason="buffered-policy",
             )
         return SchedulerReply(
-            decision="send" if baseline_pressure >= 0.45 else "wait",
+            decision="send" if baseline_pressure >= 0.35 else "wait",
             reason="baseline-policy",
         )
 
@@ -132,3 +134,20 @@ class ScriptedAgentLogic:
             )
 
         return AnalyzerReply(topics=topics, message_topics=per_message)
+
+    def mafia_vote_reply(
+        self,
+        snapshot: MafiaVoteInputSnapshot,
+        metadata: dict[str, Any],
+    ) -> MafiaVoteReply:
+        del metadata
+        if not snapshot.legal_targets:
+            return MafiaVoteReply(target_participant_id=None, reason="no-legal-targets")
+        if snapshot.phase.value == "night_action":
+            target = snapshot.legal_targets[0]
+            return MafiaVoteReply(target_participant_id=target, reason="night-target")
+        recent_text = " ".join(message.text for message in snapshot.recent_messages[-3:]).lower()
+        for target in snapshot.legal_targets:
+            if target.lower() in recent_text:
+                return MafiaVoteReply(target_participant_id=target, reason="mentioned-target")
+        return MafiaVoteReply(target_participant_id=snapshot.legal_targets[0], reason="first-legal-target")

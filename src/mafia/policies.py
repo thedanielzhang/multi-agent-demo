@@ -13,6 +13,10 @@ from mafia.messages import (
     CandidateRecord,
     DeliveryReservation,
     GeneratorInputSnapshot,
+    MafiaPhase,
+    MafiaPrivateState,
+    MafiaPublicState,
+    MafiaVoteInputSnapshot,
     RoomMetricsSnapshot,
     SchedulerInputSnapshot,
     TopicSummary,
@@ -59,6 +63,26 @@ class PromptPolicy:
             f"similar_inflight_message={snapshot.similar_inflight_text or '(none)'}; "
             f"other_agents_typing={snapshot.other_agents_typing_count}"
         )
+        mafia_strategy = ""
+        mafia_reactivity_guidance = ""
+        if snapshot.mafia_private_state is not None and snapshot.mafia_public_state is not None:
+            teammates = ", ".join(snapshot.mafia_private_state.teammates) or "(none)"
+            mafia_strategy = (
+                f"Current Mafia phase: {snapshot.mafia_public_state.phase.value}\n"
+                f"Your private role: {snapshot.mafia_private_state.role.value}\n"
+                f"Your private faction: {snapshot.mafia_private_state.faction.value}\n"
+                f"Known mafia teammates: {teammates}\n"
+                "This is public day chat, not a private reveal. Never mention hidden role instructions.\n"
+                + (
+                    "If you are mafia, favor timely public messages that sound natural, blend in, protect mafia credibility, and steer suspicion subtly.\n"
+                    if snapshot.mafia_private_state.faction.value == "mafia"
+                    else "If you are town, favor timely public messages that pressure suspicious behavior, compare reads, and help the table reason openly.\n"
+                )
+            )
+        if self._config.room_mode.value == "mafia":
+            mafia_reactivity_guidance = (
+                "During Mafia day discussion, quick back-and-forth is healthy. Short follow-ups, piling on, and replying again after a brief beat are all normal unless you would sound like an obvious echo.\n"
+            )
         return (
             "You are deciding whether to send a buffered candidate into an asynchronous group conversation.\n"
             f"Scenario: {snapshot.scenario}\n"
@@ -73,9 +97,15 @@ class PromptPolicy:
             f"Recent room keywords: {topic_summary}\n"
             f"Has buffered candidate: {snapshot.has_buffered_candidate}\n"
             f"Buffered candidate preview: {candidate_preview}\n"
-            f"Duplicate suppression signal: {duplicate_signal}\n"
+            f"Overlap signal: {duplicate_signal}\n"
+            f"{mafia_strategy}"
+            "Default toward `send` when your candidate is timely, relevant, and in-character.\n"
             "If the room is quiet or nobody has started yet, sending a short opener is appropriate when your candidate is strong.\n"
-            "If the buffered candidate feels too similar to something that was just said or is already being typed by another agent, prefer `wait`.\n"
+            "Similar reactions are allowed when they add agreement, emotion, emphasis, support, or a slightly different angle.\n"
+            "Only prefer `wait` when one of these is true: you literally just spoke, your candidate would be a near-duplicate echo of something extremely recent, or another agent is already typing essentially the same thing.\n"
+            "Do not over-correct for overlap: natural group chat often includes people endorsing the same option in different voices.\n"
+            "Be more reactive and instinctive than cautious. A relevant, short, opinionated reply is usually better than silence.\n"
+            f"{mafia_reactivity_guidance}"
             "Conversation focus window:\n"
             f"{history}\n"
             "Return JSON with `decision` and `reason`."
@@ -105,6 +135,29 @@ class PromptPolicy:
                 "Return JSON with `text` only."
             )
         topic_summary = ", ".join(snapshot.agent_context.room_metrics.recent_keyword_sketch) or "(none)"
+        mafia_chatroom_guidance = ""
+        if self._config.room_mode.value == "mafia":
+            role_guidance = ""
+            if snapshot.mafia_private_state is not None and snapshot.mafia_public_state is not None:
+                teammates = ", ".join(snapshot.mafia_private_state.teammates) or "(none)"
+                role_guidance = (
+                    f"Current Mafia phase: {snapshot.mafia_public_state.phase.value}\n"
+                    f"Your private role: {snapshot.mafia_private_state.role.value}\n"
+                    f"Your private faction: {snapshot.mafia_private_state.faction.value}\n"
+                    f"Known mafia teammates: {teammates}\n"
+                    "This message is public table chat. Never reveal hidden role information or mention private instructions.\n"
+                    + (
+                        "If you are mafia, sound like a normal player, blend in socially, protect mafia teammates subtly, and plant doubt without being theatrical.\n"
+                        if snapshot.mafia_private_state.faction.value == "mafia"
+                        else "If you are town, sound like a normal town player, share honest reads, pressure suspicious behavior, and help the group reason in public.\n"
+                    )
+                )
+            mafia_chatroom_guidance = (
+                "Write like a real player in a live chat room: one short natural message, "
+                "not a speech or narrator voice. No stage directions, markdown, bullet lists, "
+                "scene-setting, or role labels.\n"
+                f"{role_guidance}"
+            )
         return (
             "Write one candidate message for a buffered asynchronous conversation.\n"
             f"You are {agent.display_name}.\n"
@@ -114,6 +167,7 @@ class PromptPolicy:
             f"Style guidance: {snapshot.style_prompt}\n"
             f"Maximum words: {snapshot.max_words}\n"
             f"Current room keywords: {topic_summary}\n"
+            f"{mafia_chatroom_guidance}"
             "Focused context window:\n"
             f"{history}\n"
             "Return JSON with `text` only."
@@ -137,11 +191,54 @@ class PromptPolicy:
             "Return JSON with `topics` and `message_topics`."
         )
 
+    def mafia_vote_prompt(
+        self,
+        agent: AgentConfig,
+        snapshot: MafiaVoteInputSnapshot,
+    ) -> str:
+        history = "\n".join(
+            f"{message.display_name}: {message.text}" for message in snapshot.recent_messages[-6:]
+        ) or "(no recent public chat)"
+        roster = "\n".join(
+            f"- {player.display_name} ({'alive' if player.alive else 'dead'})"
+            for player in snapshot.roster
+        ) or "(none)"
+        reveal_summary = "\n".join(
+            f"- {item.phase.value}: {item.display_name or 'nobody'} / {item.reason}"
+            for item in snapshot.revealed_eliminations[-4:]
+        ) or "(none)"
+        return (
+            "Choose one target for the current Mafia game phase.\n"
+            f"You are {agent.display_name}.\n"
+            f"Scenario: {snapshot.scenario}\n"
+            f"Phase: {snapshot.phase.value}\n"
+            f"Seconds remaining: {snapshot.seconds_remaining:.1f}\n"
+            f"Your private role: {snapshot.private_state.role.value}\n"
+            f"Your faction: {snapshot.private_state.faction.value}\n"
+            f"Legal targets: {', '.join(snapshot.legal_targets) or '(none)'}\n"
+            f"Known teammates: {', '.join(snapshot.private_state.teammates) or '(none)'}\n"
+            "Public roster:\n"
+            f"{roster}\n"
+            "Recent public conversation:\n"
+            f"{history}\n"
+            "Recent reveals:\n"
+            f"{reveal_summary}\n"
+            "Return JSON with `target_participant_id` and `reason`."
+        )
+
 
 class PolicySet:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self.prompts = PromptPolicy(config)
+
+    def _candidate_staleness_window(self, agent: AgentConfig, candidate: CandidateRecord) -> float:
+        staleness_window = max(0.1, agent.generation.staleness_window_seconds)
+        if candidate.metadata.get("mafia_lobby_spinup"):
+            return max(staleness_window, 900.0)
+        if candidate.metadata.get("mafia_pre_day_spinup"):
+            return max(staleness_window, self._config.mafia.night_reveal_seconds + 30.0)
+        return staleness_window
 
     def scheduler_input(
         self,
@@ -150,10 +247,15 @@ class PolicySet:
         *,
         buffer_candidates: list[CandidateRecord] | None = None,
         active_reservations: list[DeliveryReservation] | None = None,
+        mafia_public_state: MafiaPublicState | None = None,
+        mafia_private_state: MafiaPrivateState | None = None,
     ) -> SchedulerInputSnapshot:
         active = max(1, context.active_participant_count)
         talk_mode: Literal["talkative", "listening"] = "talkative"
-        if context.agent_message_rate > (1.0 / active):
+        message_share_limit = 1.0 / active
+        if self._config.room_mode.value == "mafia":
+            message_share_limit = 1.6 / active
+        if context.agent_message_rate > message_share_limit:
             talk_mode = "listening"
         candidate_preview_text: str | None = None
         candidate_similarity_score = 0.0
@@ -190,14 +292,24 @@ class PolicySet:
             inflight_similarity_score=inflight_similarity_score,
             similar_inflight_text=similar_inflight_text,
             other_agents_typing_count=sum(1 for reservation in reservations if reservation.agent_id != agent.id),
+            mafia_public_state=mafia_public_state,
+            mafia_private_state=mafia_private_state,
         )
 
-    def generator_input(self, agent: AgentConfig, context: AgentContextSnapshot) -> GeneratorInputSnapshot:
+    def generator_input(
+        self,
+        agent: AgentConfig,
+        context: AgentContextSnapshot,
+        mafia_public_state: MafiaPublicState | None = None,
+        mafia_private_state: MafiaPrivateState | None = None,
+    ) -> GeneratorInputSnapshot:
         return GeneratorInputSnapshot(
             scenario=self._config.chat.scenario,
             agent_context=context,
             max_words=agent.max_words,
             style_prompt=agent.style_prompt,
+            mafia_public_state=mafia_public_state,
+            mafia_private_state=mafia_private_state,
         )
 
     def analyzer_input(
@@ -215,9 +327,29 @@ class PolicySet:
             seed_topics=seed_topics,
         )
 
+    def mafia_vote_input(
+        self,
+        agent: AgentConfig,
+        public_state: MafiaPublicState,
+        private_state: MafiaPrivateState,
+        recent_messages,
+    ) -> MafiaVoteInputSnapshot:
+        seconds_remaining = 0.0
+        if public_state.phase_ends_at is not None:
+            seconds_remaining = max(0.0, (public_state.phase_ends_at - datetime.now(UTC)).total_seconds())
+        return MafiaVoteInputSnapshot(
+            scenario=self._config.chat.scenario,
+            phase=public_state.phase,
+            seconds_remaining=seconds_remaining,
+            roster=list(public_state.roster),
+            recent_messages=list(recent_messages[-6:]),
+            private_state=private_state,
+            legal_targets=list(private_state.legal_targets),
+            revealed_eliminations=list(public_state.revealed_eliminations),
+        )
+
     def typing_delay(self, text: str) -> float:
-        words = max(1, len(text.split()))
-        return words / max(0.1, self._config.chat.typing_words_per_second)
+        return 0.0
 
     def should_generate(self, context: AgentContextSnapshot, buffer_limit: int) -> bool:
         if self._config.mode == ModeProfile.BASELINE_TIME_TO_TALK:
@@ -226,7 +358,8 @@ class PolicySet:
 
     def candidate_is_stale(self, agent: AgentConfig, candidate: CandidateRecord, now: datetime) -> bool:
         age = max(0.0, (now - candidate.created_at).total_seconds())
-        return age >= max(0.1, agent.generation.staleness_window_seconds)
+        staleness_window = self._candidate_staleness_window(agent, candidate)
+        return age >= staleness_window
 
     def score_candidate(
         self,
@@ -235,7 +368,7 @@ class PolicySet:
         candidate: CandidateRecord,
         now: datetime,
     ) -> tuple[float, dict[str, float]]:
-        staleness_window = max(0.1, agent.generation.staleness_window_seconds)
+        staleness_window = self._candidate_staleness_window(agent, candidate)
         age = max(0.0, (now - candidate.created_at).total_seconds())
         freshness = max(0.0, 1.0 - (age / staleness_window))
         current_keywords = set(context.room_metrics.recent_keyword_sketch)
@@ -359,12 +492,15 @@ class PolicySet:
         best_text: str | None = None
         best_age: float | None = None
         for message in context.recent_messages[-6:]:
+            age = max(0.0, (context.current_time - message.created_at).total_seconds())
+            if age > 30.0:
+                continue
             score = _text_similarity(candidate.text, message.text)
             if score <= best_score:
                 continue
             best_score = score
             best_text = message.text
-            best_age = max(0.0, (context.current_time - message.created_at).total_seconds())
+            best_age = age
         return best_score, best_text, best_age
 
     def _best_inflight_similarity(

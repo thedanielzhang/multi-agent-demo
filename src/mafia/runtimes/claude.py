@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -20,6 +21,10 @@ _PATH_PARAMS: dict[str, str] = {
     "NotebookEdit": "file_path",
 }
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(?P<body>[\s\S]*?)\s*```", re.IGNORECASE)
+_LIMIT_ERROR_RE = re.compile(
+    r"(you(?:'|’)ve hit your limit|usage limit|rate limit|quota)",
+    re.IGNORECASE,
+)
 
 
 def _make_write_guard(allowed_dir: str) -> Any:
@@ -80,6 +85,25 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     return _resolve(schema)
 
 
+def _message_text(msg: Any) -> str:
+    content = getattr(msg, "content", None)
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts).strip()
+
+
+def _terminal_error_from_message(msg: Any) -> str | None:
+    text = _message_text(msg)
+    if text and _LIMIT_ERROR_RE.search(text):
+        return text
+    return None
+
+
 class ClaudeAgentRuntime(AgentRuntime):
     """Trimmed Claude runtime adapted from iriai-build-v2 for chat-agent use."""
 
@@ -92,6 +116,7 @@ class ClaudeAgentRuntime(AgentRuntime):
         session_store: SessionStore | None = None,
         on_message: Callable[[Any], None] | None = None,
         interactive_roles: set[str] | None = None,
+        max_concurrency: int | None = None,
     ) -> None:
         try:
             import claude_agent_sdk  # noqa: F401
@@ -104,8 +129,39 @@ class ClaudeAgentRuntime(AgentRuntime):
         self.session_store = session_store
         self.on_message = on_message
         self._interactive_roles = interactive_roles or set()
+        self._semaphore = (
+            asyncio.Semaphore(max(1, max_concurrency))
+            if max_concurrency is not None
+            else None
+        )
 
     async def invoke(
+        self,
+        role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None = None,
+        workspace: Workspace | None = None,
+        session_key: str | None = None,
+    ) -> str | BaseModel:
+        if self._semaphore is None:
+            return await self._invoke_once(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+            )
+        async with self._semaphore:
+            return await self._invoke_once(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+            )
+
+    async def _invoke_once(
         self,
         role,
         prompt: str,
@@ -118,9 +174,10 @@ class ClaudeAgentRuntime(AgentRuntime):
         from claude_agent_sdk.types import ResultMessage
 
         options = self._build_options(role, workspace, output_type)
+        one_shot = bool(role.metadata.get("one_shot", False))
 
         session: AgentSession | None = None
-        if session_key and self.session_store is not None:
+        if session_key and self.session_store is not None and not one_shot:
             session = await self.session_store.load(session_key)
             if session and session.session_id:
                 options.resume = session.session_id
@@ -131,6 +188,9 @@ class ClaudeAgentRuntime(AgentRuntime):
             async for msg in client.receive_response():
                 if self.on_message is not None:
                     self.on_message(msg)
+                terminal_error = _terminal_error_from_message(msg)
+                if terminal_error:
+                    raise RuntimeError(f"Claude runtime unavailable: {terminal_error}")
                 if isinstance(msg, ResultMessage):
                     result_msg = msg
 
@@ -139,7 +199,7 @@ class ClaudeAgentRuntime(AgentRuntime):
 
         result_text = getattr(result_msg, "result", "") or ""
         session_id = getattr(result_msg, "session_id", None)
-        if session_key and self.session_store is not None:
+        if session_key and self.session_store is not None and not one_shot:
             current = session or AgentSession(session_key=session_key)
             current.session_id = session_id
             turns = list(current.metadata.get("turns", []))

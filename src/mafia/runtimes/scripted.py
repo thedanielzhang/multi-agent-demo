@@ -7,6 +7,7 @@ from typing import Any
 from mafia.compose_compat import AgentRuntime
 from mafia.messages import (
     AnalyzerInputSnapshot,
+    MafiaVoteInputSnapshot,
     SchedulerInputSnapshot,
     GeneratorInputSnapshot,
 )
@@ -43,6 +44,9 @@ class ScriptedAgentRuntime(AgentRuntime):
         if worker_kind == "analyzer":
             snapshot = AnalyzerInputSnapshot.model_validate(payload)
             return self._logic.analyzer_reply(snapshot)
+        if worker_kind == "voter":
+            snapshot = MafiaVoteInputSnapshot.model_validate(payload)
+            return self._logic.mafia_vote_reply(snapshot, role.metadata)
         return ""
 
     def _parse_input(self, prompt: str) -> dict[str, Any]:

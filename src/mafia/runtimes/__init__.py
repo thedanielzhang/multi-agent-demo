@@ -24,6 +24,18 @@ _RUNTIME_ALIASES = {
 _RUNTIME_FACTORIES: dict[str, RuntimeFactory] = {}
 
 
+def _runtime_kwargs(config: RuntimeConfig, context: RuntimeContext) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model": config.model,
+        "session_store": context.session_store,
+        "on_message": context.on_message,
+        "interactive_roles": context.interactive_roles,
+    }
+    if config.max_concurrency is not None:
+        kwargs["max_concurrency"] = config.max_concurrency
+    return kwargs
+
+
 def _default_model_for(runtime_name: str) -> str:
     if runtime_name == "claude":
         return "claude-haiku-4-5-20251001"
@@ -79,6 +91,7 @@ def create_agent_runtime(
     name: str | None,
     *,
     model: str | None = None,
+    max_concurrency: int | None = None,
     session_store=None,
     on_message=None,
     interactive_roles: set[str] | None = None,
@@ -96,7 +109,11 @@ def create_agent_runtime(
         interactive_roles=set(interactive_roles or set()),
     )
     return factory(
-        RuntimeConfig(provider=runtime_name, model=model or _default_model_for(runtime_name)),
+        RuntimeConfig(
+            provider=runtime_name,
+            model=model or _default_model_for(runtime_name),
+            max_concurrency=max_concurrency,
+        ),
         context,
     )
 
@@ -111,6 +128,7 @@ def build_runtime(
     return create_agent_runtime(
         config.provider,
         model=config.model,
+        max_concurrency=config.max_concurrency,
         session_store=session_store,
         on_message=on_message,
         interactive_roles=interactive_roles,
@@ -124,19 +142,13 @@ register_runtime(
 register_runtime(
     "claude",
     lambda config, context: ClaudeAgentRuntime(
-        model=config.model,
-        session_store=context.session_store,
-        on_message=context.on_message,
-        interactive_roles=context.interactive_roles,
+        **_runtime_kwargs(config, context),
     ),
 )
 register_runtime(
     "codex",
     lambda config, context: CodexAgentRuntime(
-        model=config.model,
-        session_store=context.session_store,
-        on_message=context.on_message,
-        interactive_roles=context.interactive_roles,
+        **_runtime_kwargs(config, context),
     ),
 )
 

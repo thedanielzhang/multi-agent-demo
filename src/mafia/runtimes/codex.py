@@ -49,6 +49,7 @@ class CodexAgentRuntime(AgentRuntime):
         on_message: Any | None = None,
         interactive_roles: set[str] | None = None,
         codex_command: str = "codex",
+        max_concurrency: int | None = None,
     ) -> None:
         if shutil.which(codex_command) is None:
             raise ImportError(
@@ -60,6 +61,11 @@ class CodexAgentRuntime(AgentRuntime):
         self.on_message = on_message
         self._interactive_roles = interactive_roles or set()
         self._codex_command = codex_command
+        self._semaphore = (
+            asyncio.Semaphore(max(1, max_concurrency))
+            if max_concurrency is not None
+            else None
+        )
 
     async def invoke(
         self,
@@ -70,8 +76,35 @@ class CodexAgentRuntime(AgentRuntime):
         workspace: Workspace | None = None,
         session_key: str | None = None,
     ) -> str | BaseModel:
+        if self._semaphore is None:
+            return await self._invoke_once(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+            )
+        async with self._semaphore:
+            return await self._invoke_once(
+                role,
+                prompt,
+                output_type=output_type,
+                workspace=workspace,
+                session_key=session_key,
+            )
+
+    async def _invoke_once(
+        self,
+        role,
+        prompt: str,
+        *,
+        output_type: type[BaseModel] | None = None,
+        workspace: Workspace | None = None,
+        session_key: str | None = None,
+    ) -> str | BaseModel:
+        one_shot = bool(role.metadata.get("one_shot", False))
         session: AgentSession | None = None
-        if session_key and self.session_store is not None:
+        if session_key and self.session_store is not None and not one_shot:
             session = await self.session_store.load(session_key)
 
         effective_prompt = self._compose_prompt(
@@ -87,7 +120,7 @@ class CodexAgentRuntime(AgentRuntime):
             output_type=output_type,
         )
 
-        if session_key and self.session_store is not None:
+        if session_key and self.session_store is not None and not one_shot:
             current = session or AgentSession(session_key=session_key)
             turns = list(current.metadata.get("turns", []))
             turns.append({"role": "user", "text": prompt, "turn": len(turns) + 1})
