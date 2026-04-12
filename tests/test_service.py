@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from mafia.config import AppConfig, ModeProfile, RoomMode
-from mafia.service import create_app
+from mafia.service import ChatRoomService, create_app
 
 
 def _receive_until(websocket, expected_type: str, *, key: str | None = None, value=None, limit: int = 20):
@@ -79,6 +79,16 @@ def _mafia_service_config(config: AppConfig) -> AppConfig:
     service_config.mafia.night_action_seconds = 1.0
     service_config.mafia.night_reveal_seconds = 0.2
     return service_config
+
+
+def test_app_config_defaults_regular_rooms_to_improved_mode():
+    config = AppConfig(
+        runtime={"provider": "scripted"},
+        chat={"scenario": "You are coworkers planning lunch."},
+        agents=[],
+    )
+    assert config.room_mode == RoomMode.REGULAR
+    assert config.mode == ModeProfile.IMPROVED_BUFFERED_ASYNC
 
 
 def test_two_humans_receive_same_committed_message(baseline_config):
@@ -163,6 +173,7 @@ def test_pages_and_config_api_render(baseline_config):
         assert app_js.status_code == 200
         assert "createRoot" in app_js.text
         assert "Mafia game scenario:" in app_js.text
+        assert "Agents are spinning up" in app_js.text
 
         app_css = client.get("/assets/react-app.css")
         assert app_css.status_code == 200
@@ -416,6 +427,64 @@ def test_mafia_lobby_requires_names_and_starts_only_after_manual_start(improved_
             status = client.get("/api/rooms/ready-gate/status").json()
             assert status["mafia_state"]["phase"] == "day_discussion"
             assert len(status["mafia_state"]["roster"]) == status["draft_config"]["mafia"]["total_players"]
+
+
+def test_mafia_lobby_reports_agent_spinup_ready_live(improved_config):
+    app = create_app(_mafia_service_config(improved_config))
+    with TestClient(app) as client:
+        created = client.post("/api/rooms", json={"room_id": "spinup-live"})
+        assert created.status_code == 200
+
+        with client.websocket_connect("/ws/spinup-live") as websocket:
+            snapshot = websocket.receive_json()
+            assert snapshot["type"] == "room_snapshot"
+            assert snapshot["status"]["run_state"] == "running"
+            assert snapshot["status"]["mafia_state"]["phase"] == "lobby"
+
+            presence = _receive_payload_until(
+                websocket,
+                lambda payload: payload.get("type") == "presence_changed"
+                and (payload.get("mafia_lobby_spinup") or {}).get("ready") is True,
+                limit=120,
+            )
+            spinup = presence["mafia_lobby_spinup"]
+            assert spinup["active"] is True
+            assert spinup["ready_count"] == spinup["total_agents"]
+            assert spinup["failed_count"] == 0
+            assert all(agent["status"] == "ready" for agent in spinup["agents"])
+
+
+def test_mafia_game_start_waits_for_agent_spinup(monkeypatch, improved_config):
+    original = ChatRoomService._mafia_lobby_spinup_status
+
+    def fake_spinup_status(self, config=None, *, run_state=None):
+        spinup = original(self, config, run_state=run_state)
+        if spinup and spinup["active"]:
+            return {
+                **spinup,
+                "ready": False,
+                "ready_count": 0,
+                "failed_count": 0,
+                "pending_count": spinup["total_agents"],
+                "agents": [
+                    {
+                        **agent,
+                        "status": "spinning_up",
+                    }
+                    for agent in spinup["agents"]
+                ],
+            }
+        return spinup
+
+    monkeypatch.setattr(ChatRoomService, "_mafia_lobby_spinup_status", fake_spinup_status)
+    app = create_app(_mafia_service_config(improved_config))
+    with TestClient(app) as client:
+        created = client.post("/api/rooms", json={"room_id": "spinup-gate"})
+        assert created.status_code == 200
+
+        second = client.post("/api/rooms/spinup-gate/start")
+        assert second.status_code == 409
+        assert "agents are still spinning up" in second.json()["detail"]
 
 
 def test_mafia_game_can_start_with_all_models_and_no_joined_humans(improved_config):

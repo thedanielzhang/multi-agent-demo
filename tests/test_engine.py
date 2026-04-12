@@ -16,16 +16,45 @@ from mafia.agent import AgentInvoker
 from mafia.compose_compat import Workspace
 from mafia.engine import ConversationEngine, load_config
 from mafia.event_log import EventLog
-from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, MafiaFaction, MafiaGameSnapshot, MafiaGameStatus, MafiaPhase, MafiaPlayerRecord, MafiaPrivateState, MafiaPublicState, MafiaRole, RoomMetricsSnapshot, TopicSummary, make_event, utc_now
+from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, MafiaFaction, MafiaGameSnapshot, MafiaGameStatus, MafiaPhase, MafiaPlayerRecord, MafiaPrivateState, MafiaPublicState, MafiaRole, RoomMetricsSnapshot, SchedulerInputSnapshot, TopicSummary, make_event, utc_now
 from mafia.mafia_controller import MafiaGameController, mafia_count_for_players
-from mafia.messages import CandidateRecord, ConversationMessage
+from mafia.messages import CandidateRecord, CommitmentState, ConversationMessage, DeliveryReservation, OpenQuestionState, ResponseSlotState, RoomDiscourseStateSnapshot
 from mafia.mafia_personas import generate_mafia_personas
 from mafia.policies import PolicySet
 from mafia.projections import ProjectionRegistry
 from mafia.runtimes import ScriptedAgentRuntime
+from mafia.scripted_logic import ScriptedAgentLogic
 from mafia.transport import register_transport
+from mafia.workers import AgentDeliveryWorker
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _message(
+    *,
+    message_id: str,
+    client_message_id: str,
+    sender_id: str,
+    display_name: str,
+    text: str,
+    created_at,
+    sequence_no: int,
+    mentions: list[str] | None = None,
+    reply_hint: str | None = None,
+    sender_kind="human",
+) -> ConversationMessage:
+    return ConversationMessage(
+        message_id=message_id,
+        client_message_id=client_message_id,
+        sender_id=sender_id,
+        sender_kind=sender_kind,
+        display_name=display_name,
+        text=text,
+        created_at=created_at,
+        sequence_no=sequence_no,
+        mentions=mentions or [],
+        reply_hint=reply_hint,
+    )
 
 
 async def _shutdown(engine: ConversationEngine) -> list[LoggedEvent]:
@@ -151,6 +180,23 @@ class SlowVoterRuntime(ScriptedAgentRuntime):
         if role.name == "voter":
             await asyncio.sleep(self.delay_seconds)
         return await super().invoke(role, prompt, **kwargs)
+
+
+class DeliveryTestEngine:
+    def __init__(self, config, registry, event_log) -> None:
+        self.config = config
+        self.registry = registry
+        self.event_log = event_log
+        self.policies = PolicySet(config)
+        self.commands: list[CommandEnvelope] = []
+
+    async def append_event(self, event):
+        logged = await self.event_log.append(event)
+        await self.registry.wait_until(logged.seq)
+        return logged
+
+    async def dispatch_command(self, command: CommandEnvelope) -> None:
+        self.commands.append(command)
 
 
 @pytest.mark.asyncio
@@ -790,7 +836,7 @@ def test_scheduler_input_exposes_duplicate_suppression_signal(improved_config):
     policies = PolicySet(improved_config)
     agent = improved_config.agents[0]
     current_time = __import__("datetime").datetime.now(__import__("datetime").UTC)
-    recent_message = ConversationMessage(
+    recent_message = _message(
         message_id="m1",
         client_message_id="c1",
         sender_id="other",
@@ -833,6 +879,788 @@ def test_scheduler_input_exposes_duplicate_suppression_signal(improved_config):
     assert scheduler_input.candidate_preview_text == "thai sounds good to me"
     assert scheduler_input.candidate_similarity_score >= 0.99
     assert scheduler_input.similar_recent_message_text == "thai sounds good to me"
+
+
+def test_scheduler_input_prefers_direct_mention_for_reply_target(improved_config):
+    policies = PolicySet(improved_config)
+    agent = improved_config.agents[0]
+    current_time = utc_now()
+    older_question = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="jordan",
+        display_name="Jordan",
+        text="what do you think?",
+        created_at=current_time - timedelta(seconds=2),
+        sequence_no=1,
+    )
+    direct_mention = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id="casey",
+        display_name="Casey",
+        text=f"{agent.display_name}, that's a bad read",
+        created_at=current_time - timedelta(seconds=1),
+        sequence_no=2,
+        mentions=[agent.id],
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[older_question, direct_mention],
+        focus_messages=[older_question, direct_mention],
+        focus_message_ids=["m1", "m2"],
+        room_metrics=RoomMetricsSnapshot(watermark=2, active_participant_count=3, recent_keyword_sketch=["read", "vote"]),
+        active_participant_count=3,
+        time_since_last_any=0.8,
+        time_since_last_own=4.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(candidate_id="cand-1", agent_id=agent.id, text="nah that doesn't track", created_at=current_time)
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.reply_target_message_id == "m2"
+    assert scheduler_input.reply_target_reason == "direct_mention"
+    assert scheduler_input.obligation_strength == "high"
+    assert scheduler_input.floor_state == "addressed_response_slot"
+
+
+def test_scheduler_input_prefers_reply_hint_over_recent_turn(improved_config):
+    policies = PolicySet(improved_config)
+    agent = improved_config.agents[0]
+    current_time = utc_now()
+    hinted = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="jordan",
+        display_name="Jordan",
+        text="responding to you here",
+        created_at=current_time - timedelta(seconds=2),
+        sequence_no=1,
+        reply_hint=agent.id,
+    )
+    recent_turn = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id="casey",
+        display_name="Casey",
+        text="another thought",
+        created_at=current_time - timedelta(seconds=1),
+        sequence_no=2,
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[hinted, recent_turn],
+        focus_messages=[hinted, recent_turn],
+        focus_message_ids=["m1", "m2"],
+        room_metrics=RoomMetricsSnapshot(watermark=2, active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=0.5,
+        time_since_last_own=3.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(candidate_id="cand-1", agent_id=agent.id, text="here's my read", created_at=current_time)
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.reply_target_message_id == "m1"
+    assert scheduler_input.reply_target_reason == "reply_hint"
+
+
+def test_scheduler_input_direct_question_yields_high_obligation(improved_config):
+    policies = PolicySet(improved_config)
+    agent = improved_config.agents[0]
+    current_time = utc_now()
+    question = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="jordan",
+        display_name="Jordan",
+        text=f"{agent.display_name}, who are you voting?",
+        created_at=current_time - timedelta(seconds=1),
+        sequence_no=1,
+        mentions=[agent.id],
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=1,
+        current_time=current_time,
+        recent_messages=[question],
+        focus_messages=[question],
+        focus_message_ids=["m1"],
+        room_metrics=RoomMetricsSnapshot(watermark=1, active_participant_count=2),
+        active_participant_count=2,
+        time_since_last_any=0.2,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(candidate_id="cand-1", agent_id=agent.id, text="i'm leaning jordan", created_at=current_time)
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.obligation_strength == "high"
+    assert scheduler_input.candidate_turn_kind == "answer"
+
+
+def test_scheduler_input_recent_self_turn_yields_cooldown_floor_state(improved_config):
+    policies = PolicySet(improved_config)
+    agent = improved_config.agents[0]
+    current_time = utc_now()
+    prior_other = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="casey",
+        display_name="Casey",
+        text="maybe we split votes",
+        created_at=current_time - timedelta(seconds=1),
+        sequence_no=1,
+    )
+    own_recent = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id=agent.id,
+        display_name=agent.display_name,
+        text="i still think casey's off",
+        created_at=current_time - timedelta(seconds=0.1),
+        sequence_no=2,
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[prior_other, own_recent],
+        focus_messages=[prior_other, own_recent],
+        focus_message_ids=["m1", "m2"],
+        room_metrics=RoomMetricsSnapshot(watermark=2, active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=0.1,
+        time_since_last_own=0.1,
+        has_sent_message=True,
+        own_message_count=1,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(candidate_id="cand-1", agent_id=agent.id, text="and jordan too", created_at=current_time)
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.obligation_strength in {"low", "none"}
+    assert scheduler_input.floor_state == "cooldown_after_self_turn"
+
+
+def test_mafia_active_burst_yields_brief_overlap_ok_floor_state(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    agent = config.agents[0]
+    current_time = utc_now()
+    recent = [
+        _message(
+            message_id=f"m{index}",
+            client_message_id=f"c{index}",
+            sender_id=f"other-{index}",
+            display_name=f"Other {index}",
+            text=f"message {index}",
+            created_at=current_time - timedelta(seconds=1.5 - (index * 0.2)),
+            sequence_no=index,
+        )
+        for index in range(1, 4)
+    ]
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=3,
+        current_time=current_time,
+        recent_messages=recent,
+        focus_messages=recent,
+        focus_message_ids=[message.message_id for message in recent],
+        room_metrics=RoomMetricsSnapshot(watermark=3, active_participant_count=4),
+        active_participant_count=4,
+        time_since_last_any=0.4,
+        time_since_last_own=4.0,
+        recent_message_count=3,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(candidate_id="cand-1", agent_id=agent.id, text="yeah exactly", created_at=current_time)
+    scheduler_input = policies.scheduler_input(
+        agent,
+        context,
+        buffer_candidates=[candidate],
+        active_reservations=[],
+        mafia_public_state=MafiaPublicState(game_status=MafiaGameStatus.ACTIVE, phase=MafiaPhase.DAY_DISCUSSION),
+        mafia_private_state=MafiaPrivateState(participant_id=agent.id, role=MafiaRole.TOWN, faction=MafiaFaction.TOWN, alive=True),
+    )
+    assert scheduler_input.floor_state == "brief_overlap_ok"
+    assert scheduler_input.candidate_turn_kind == "backchannel"
+
+
+def test_scripted_scheduler_allows_same_text_when_reply_target_differs():
+    logic = ScriptedAgentLogic()
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id="alex",
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=3.0,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    snapshot = SchedulerInputSnapshot(
+        scenario="Mafia",
+        agent_context=context,
+        goals=[],
+        talk_mode="talkative",
+        current_time_label=current_time.isoformat(),
+        has_buffered_candidate=True,
+        candidate_preview_text="yeah same",
+        candidate_similarity_score=0.99,
+        similar_recent_message_text="yeah same",
+        similar_recent_message_age_seconds=1.0,
+        similar_recent_same_reply_target=False,
+        similar_recent_same_turn_kind=True,
+        reply_target_display_name="Jordan",
+        reply_target_reason="recent_question",
+        obligation_strength="medium",
+        floor_state="open_floor",
+        candidate_turn_kind="agreement",
+    )
+    reply = logic.scheduler_reply(snapshot, {"talkativeness": 0.9, "confidence": 0.9, "reactivity": 1.0})
+    assert reply.decision == "send"
+
+
+def test_scripted_scheduler_waits_on_exact_echo_same_target_same_turn():
+    logic = ScriptedAgentLogic()
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id="alex",
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=3.0,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    snapshot = SchedulerInputSnapshot(
+        scenario="Mafia",
+        agent_context=context,
+        goals=[],
+        talk_mode="talkative",
+        current_time_label=current_time.isoformat(),
+        has_buffered_candidate=True,
+        candidate_preview_text="yeah same",
+        candidate_similarity_score=0.99,
+        similar_recent_message_text="yeah same",
+        similar_recent_message_age_seconds=1.0,
+        similar_recent_same_reply_target=True,
+        similar_recent_same_turn_kind=True,
+        reply_target_display_name="Jordan",
+        reply_target_reason="recent_question",
+        obligation_strength="medium",
+        floor_state="open_floor",
+        candidate_turn_kind="agreement",
+    )
+    reply = logic.scheduler_reply(snapshot, {"talkativeness": 0.9, "confidence": 0.9, "reactivity": 1.0})
+    assert reply.decision == "wait"
+    assert reply.reason == "duplicate-recent-message"
+
+
+def test_scripted_scheduler_sends_direct_question_even_when_room_is_active():
+    logic = ScriptedAgentLogic()
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id="alex",
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=0.01,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    snapshot = SchedulerInputSnapshot(
+        scenario="Mafia",
+        agent_context=context,
+        goals=[],
+        talk_mode="listening",
+        current_time_label=current_time.isoformat(),
+        has_buffered_candidate=True,
+        candidate_preview_text="i'm voting jordan",
+        reply_target_display_name="Jordan",
+        reply_target_reason="direct_mention",
+        obligation_strength="high",
+        floor_state="addressed_response_slot",
+        candidate_turn_kind="answer",
+    )
+    reply = logic.scheduler_reply(snapshot, {"talkativeness": 0.8, "confidence": 0.8, "reactivity": 1.0})
+    assert reply.decision == "send"
+
+
+def test_scripted_scheduler_allows_brief_acks_more_readily_in_mafia_overlap_window():
+    logic = ScriptedAgentLogic()
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id="alex",
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=5),
+        active_participant_count=5,
+        time_since_last_any=0.08,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    regular_snapshot = SchedulerInputSnapshot(
+        scenario="Regular room",
+        agent_context=context,
+        goals=[],
+        talk_mode="talkative",
+        current_time_label=current_time.isoformat(),
+        has_buffered_candidate=True,
+        candidate_preview_text="yeah exactly",
+        reply_target_display_name="Jordan",
+        reply_target_reason="recent_turn",
+        obligation_strength="low",
+        floor_state="open_floor",
+        candidate_turn_kind="backchannel",
+    )
+    mafia_snapshot = regular_snapshot.model_copy(update={"scenario": "Mafia", "floor_state": "brief_overlap_ok"})
+    regular_reply = logic.scheduler_reply(regular_snapshot, {"talkativeness": 0.55, "confidence": 0.45, "reactivity": 1.0})
+    mafia_reply = logic.scheduler_reply(mafia_snapshot, {"talkativeness": 0.55, "confidence": 0.45, "reactivity": 1.0})
+    assert regular_reply.decision == "wait"
+    assert mafia_reply.decision == "send"
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_direct_question_assigns_and_clears_slot(improved_config):
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, improved_config)
+    await registry.start()
+    agent = improved_config.agents[0]
+    now = utc_now()
+
+    question = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="human-1",
+        display_name="Daniel",
+        text=f"{agent.display_name}, what do you mean by that?",
+        created_at=now,
+        sequence_no=1,
+        mentions=[agent.id],
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=question.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    state = registry.discourse_state()
+    assert state.strict_turn_active is True
+    assert state.slot_owner_id == agent.id
+    assert state.slot_reason == "direct_question"
+    assert state.open_questions[0].target_participant_id == agent.id
+
+    answer = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id=agent.id,
+        display_name=agent.display_name,
+        sender_kind="agent",
+        text="I mean each project should stay isolated.",
+        created_at=now + timedelta(seconds=1),
+        sequence_no=2,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=answer.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    state = registry.discourse_state()
+    assert state.strict_turn_active is False
+    assert state.slot_owner_id is None
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_unnamed_strict_turn_uses_round_robin(improved_config):
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, improved_config)
+    await registry.start()
+    now = utc_now()
+
+    first_prompt = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="human-1",
+        display_name="Daniel",
+        text="One at a time please.",
+        created_at=now,
+        sequence_no=1,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=first_prompt.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    first_state = registry.discourse_state()
+    assert first_state.slot_owner_id == improved_config.agents[0].id
+    assert first_state.slot_reason == "strict_turn_unnamed"
+
+    first_reply = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id=improved_config.agents[0].id,
+        display_name=improved_config.agents[0].display_name,
+        sender_kind="agent",
+        text="State isolation is the key constraint.",
+        created_at=now + timedelta(seconds=1),
+        sequence_no=2,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=first_reply.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    second_prompt = _message(
+        message_id="m3",
+        client_message_id="c3",
+        sender_id="human-1",
+        display_name="Daniel",
+        text="One at a time please.",
+        created_at=now + timedelta(seconds=2),
+        sequence_no=3,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=second_prompt.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    second_state = registry.discourse_state()
+    assert second_state.slot_owner_id == improved_config.agents[1].id
+    assert second_state.last_strict_turn_owner_id == improved_config.agents[1].id
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_tracks_resolved_questions_and_commitments(improved_config):
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, improved_config)
+    await registry.start()
+    now = utc_now()
+
+    messages = [
+        _message(
+            message_id="m1",
+            client_message_id="c1",
+            sender_id="human-1",
+            display_name="Daniel",
+            text="Should we isolate state per project?",
+            created_at=now,
+            sequence_no=1,
+        ),
+        _message(
+            message_id="m2",
+            client_message_id="c2",
+            sender_id="human-1",
+            display_name="Daniel",
+            text="Yes, state isolation should be locked per project.",
+            created_at=now + timedelta(seconds=1),
+            sequence_no=2,
+        ),
+        _message(
+            message_id="m3",
+            client_message_id="c3",
+            sender_id="human-1",
+            display_name="Daniel",
+            text="No context switching between projects.",
+            created_at=now + timedelta(seconds=2),
+            sequence_no=3,
+        ),
+    ]
+    for message in messages:
+        logged = await event_log.append(
+            make_event(
+                "conversation.event.message.committed",
+                payload=message.model_dump(mode="json"),
+            )
+        )
+        await registry.wait_until(logged.seq)
+
+    state = registry.discourse_state()
+    assert not state.open_questions
+    assert "m1" in state.resolved_question_ids
+    assert any(commitment.source_message_id == "m2" for commitment in state.accepted_commitments)
+    assert any(commitment.source_message_id == "m3" for commitment in state.rejected_commitments)
+    await registry.close()
+
+
+def test_scheduler_input_flags_reopening_resolved_question_and_commitment_conflict(improved_config):
+    policies = PolicySet(improved_config)
+    agent = improved_config.agents[0]
+    current_time = utc_now()
+    discourse_state = RoomDiscourseStateSnapshot(
+        resolved_question_ids=["m1"],
+        resolved_questions=[
+            OpenQuestionState(
+                question_id="m1",
+                source_message_id="m1",
+                asker_id="human-1",
+                asker_display_name="Daniel",
+                text_excerpt="Should we isolate state per project?",
+                keyword_sketch=["isolate", "state", "project"],
+                created_at=current_time - timedelta(seconds=5),
+                resolved=True,
+                resolved_by_message_id="m2",
+            )
+        ],
+        rejected_commitments=[
+            CommitmentState(
+                source_message_id="m3",
+                polarity="rejected",
+                keyword_sketch=["context", "switching", "project"],
+                canonical_text="No context switching between projects.",
+                created_at=current_time - timedelta(seconds=4),
+            )
+        ],
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=3,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(watermark=3, active_participant_count=3),
+        discourse_state=discourse_state,
+        active_participant_count=3,
+        time_since_last_any=0.8,
+        time_since_last_own=4.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(
+        candidate_id="cand-1",
+        agent_id=agent.id,
+        text="Should we allow context switching between projects instead of isolating state per project?",
+        created_at=current_time,
+    )
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.candidate_reopens_resolved_question is True
+    assert scheduler_input.candidate_conflicts_with_commitment is True
+
+
+def test_scripted_scheduler_waits_when_strict_turn_belongs_to_someone_else():
+    logic = ScriptedAgentLogic()
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id="alex",
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        active_participant_count=3,
+        time_since_last_any=0.2,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    snapshot = SchedulerInputSnapshot(
+        scenario="Regular room",
+        agent_context=context,
+        goals=[],
+        talk_mode="talkative",
+        current_time_label=current_time.isoformat(),
+        has_buffered_candidate=True,
+        candidate_preview_text="here's my take",
+        strict_turn_active=True,
+        slot_owner_id="jordan",
+        slot_reason="direct_question",
+        candidate_matches_slot=False,
+        obligation_strength="none",
+        floor_state="open_floor",
+        candidate_turn_kind="answer",
+    )
+    reply = logic.scheduler_reply(snapshot, {"talkativeness": 1.0, "confidence": 1.0, "reactivity": 1.0})
+    assert reply.decision == "wait"
+    assert reply.reason == "strict_turn_slot_taken"
+
+
+def test_generator_prompt_includes_commitments_and_contribution_mode(improved_config):
+    config = improved_config.model_copy(deep=True)
+    agent = config.agents[0]
+    agent.goals = ["define the system architecture and technical spec"]
+    policies = PolicySet(config)
+    current_time = utc_now()
+    discourse_state = RoomDiscourseStateSnapshot(
+        strict_turn_active=True,
+        slot_owner_id=agent.id,
+        slot_reason="direct_question",
+        open_questions=[
+            OpenQuestionState(
+                question_id="m1",
+                source_message_id="m1",
+                asker_id="human-1",
+                asker_display_name="Daniel",
+                text_excerpt="How should isolation work per project?",
+                keyword_sketch=["isolation", "project"],
+                created_at=current_time - timedelta(seconds=4),
+            )
+        ],
+        accepted_commitments=[
+            CommitmentState(
+                source_message_id="m2",
+                polarity="accepted",
+                keyword_sketch=["isolation", "project"],
+                canonical_text="State isolation should be locked per project.",
+                created_at=current_time - timedelta(seconds=3),
+            )
+        ],
+        rejected_commitments=[
+            CommitmentState(
+                source_message_id="m3",
+                polarity="rejected",
+                keyword_sketch=["context", "switching"],
+                canonical_text="No context switching between projects.",
+                created_at=current_time - timedelta(seconds=2),
+            )
+        ],
+    )
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=3,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(watermark=3, active_participant_count=3),
+        discourse_state=discourse_state,
+        active_participant_count=3,
+        time_since_last_any=0.5,
+        time_since_last_own=3.0,
+        buffer_size=0,
+        buffer_version=0,
+        run_state="running",
+    )
+    prompt = policies.prompts.generator_prompt(agent, policies.generator_input(agent, context))
+    assert "Contribution mode: concretize_constraints" in prompt
+    assert "Recent accepted decisions:" in prompt
+    assert "State isolation should be locked per project." in prompt
+    assert "Recent rejected decisions:" in prompt
+    assert "No context switching between projects." in prompt
+    assert "Unresolved open questions:" in prompt
+    assert "How should isolation work per project?" in prompt
+    assert "You currently own the response slot: True" in prompt
+
+
+@pytest.mark.asyncio
+async def test_delivery_worker_aborts_candidate_that_reopens_resolved_question(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.agents = [config.agents[0]]
+    agent = config.agents[0]
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, config)
+    await registry.start()
+    engine = DeliveryTestEngine(config, registry, event_log)
+    worker = AgentDeliveryWorker(engine, config, agent)
+    now = utc_now()
+
+    history = [
+        _message(
+            message_id="m1",
+            client_message_id="c1",
+            sender_id="human-1",
+            display_name="Daniel",
+            text="Should we isolate state per project?",
+            created_at=now,
+            sequence_no=1,
+        ),
+        _message(
+            message_id="m2",
+            client_message_id="c2",
+            sender_id="human-1",
+            display_name="Daniel",
+            text="Yes, state isolation should be locked per project.",
+            created_at=now + timedelta(seconds=1),
+            sequence_no=2,
+        ),
+    ]
+    for message in history:
+        logged = await event_log.append(
+            make_event(
+                "conversation.event.message.committed",
+                payload=message.model_dump(mode="json"),
+            )
+        )
+        await registry.wait_until(logged.seq)
+
+    reservation = DeliveryReservation(
+        reservation_id="res-1",
+        agent_id=agent.id,
+        candidate=CandidateRecord(
+            candidate_id="cand-1",
+            agent_id=agent.id,
+            text="Should we revisit project isolation?",
+            created_at=utc_now(),
+        ),
+        client_message_id="client-1",
+        created_at=utc_now(),
+    )
+    logged = await event_log.append(
+        make_event(
+            f"agent.event.{agent.id}.candidate.reserved",
+            payload=reservation.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    command = CommandEnvelope(
+        subject=f"agent.command.{agent.id}.deliver.request",
+        payload={"reservation_id": reservation.reservation_id},
+    )
+    await worker.handle_request(command)
+
+    events = await event_log.snapshot()
+    aborted = next(
+        logged
+        for logged in events
+        if logged.event.subject == f"agent.event.{agent.id}.delivery.aborted"
+    )
+    assert aborted.event.payload["reason"] == "resolved_question_reopened"
+    assert not engine.commands
+    await registry.close()
 
 
 @pytest.mark.asyncio

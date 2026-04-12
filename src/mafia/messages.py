@@ -343,6 +343,47 @@ class RoomMetricsSnapshot(BaseModel):
     time_since_last_any: float = 0.0
 
 
+class ResponseSlotState(BaseModel):
+    active: bool = False
+    owner_id: str | None = None
+    reason: str = "none"
+    source_message_id: str | None = None
+
+
+class OpenQuestionState(BaseModel):
+    question_id: str
+    source_message_id: str
+    asker_id: str
+    asker_display_name: str
+    target_participant_id: str | None = None
+    text_excerpt: str
+    keyword_sketch: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved: bool = False
+    resolved_by_message_id: str | None = None
+
+
+class CommitmentState(BaseModel):
+    source_message_id: str
+    polarity: Literal["accepted", "rejected"]
+    keyword_sketch: list[str] = Field(default_factory=list)
+    canonical_text: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class RoomDiscourseStateSnapshot(BaseModel):
+    strict_turn_active: bool = False
+    slot_owner_id: str | None = None
+    slot_reason: str = "none"
+    slot_source_message_id: str | None = None
+    open_questions: list[OpenQuestionState] = Field(default_factory=list)
+    resolved_question_ids: list[str] = Field(default_factory=list)
+    resolved_questions: list[OpenQuestionState] = Field(default_factory=list)
+    accepted_commitments: list[CommitmentState] = Field(default_factory=list)
+    rejected_commitments: list[CommitmentState] = Field(default_factory=list)
+    last_strict_turn_owner_id: str | None = None
+
+
 class AgentTopicSnapshot(BaseModel):
     snapshot_id: str
     agent_id: str
@@ -371,6 +412,7 @@ class AgentContextSnapshot(BaseModel):
     topic_snapshot_id: str | None = None
     topic_snapshot: AgentTopicSnapshot | None = None
     room_metrics: RoomMetricsSnapshot = Field(default_factory=RoomMetricsSnapshot)
+    discourse_state: RoomDiscourseStateSnapshot = Field(default_factory=RoomDiscourseStateSnapshot)
     memory_summary: dict[str, float] = Field(default_factory=dict)
     active_participant_count: int = 0
     agent_message_rate: float = 0.0
@@ -395,6 +437,11 @@ class GeneratorInputSnapshot(BaseModel):
     agent_context: AgentContextSnapshot
     max_words: int
     style_prompt: str
+    contribution_mode: Literal["concretize_constraints", "frame_requirements", "translate_into_interface", "generic_collaborator"] = "generic_collaborator"
+    owns_response_slot: bool = False
+    recent_open_questions: list[OpenQuestionState] = Field(default_factory=list)
+    accepted_commitments: list[CommitmentState] = Field(default_factory=list)
+    rejected_commitments: list[CommitmentState] = Field(default_factory=list)
     mafia_public_state: MafiaPublicState | None = None
     mafia_private_state: MafiaPrivateState | None = None
 
@@ -408,11 +455,33 @@ class SchedulerInputSnapshot(BaseModel):
     has_buffered_candidate: bool = False
     candidate_preview_text: str | None = None
     candidate_similarity_score: float = 0.0
+    similar_recent_message_id: str | None = None
     similar_recent_message_text: str | None = None
     similar_recent_message_age_seconds: float | None = None
+    similar_recent_same_reply_target: bool = False
+    similar_recent_same_turn_kind: bool = False
     inflight_similarity_score: float = 0.0
     similar_inflight_text: str | None = None
+    similar_inflight_same_reply_target: bool = False
+    similar_inflight_same_turn_kind: bool = False
     other_agents_typing_count: int = 0
+    strict_turn_active: bool = False
+    slot_owner_id: str | None = None
+    slot_reason: str = "none"
+    reply_target_message_id: str | None = None
+    reply_target_speaker_id: str | None = None
+    reply_target_display_name: str | None = None
+    reply_target_reason: Literal["direct_mention", "reply_hint", "recent_question", "recent_turn", "none"] = "none"
+    obligation_strength: Literal["none", "low", "medium", "high"] = "none"
+    floor_state: Literal["open_floor", "addressed_response_slot", "brief_overlap_ok", "cooldown_after_self_turn"] = "open_floor"
+    candidate_turn_kind: Literal["backchannel", "agreement", "answer", "challenge", "proposal", "repair", "summary", "pivot", "stance"] = "stance"
+    candidate_matches_slot: bool = False
+    candidate_answers_open_question_id: str | None = None
+    recent_open_questions: list[OpenQuestionState] = Field(default_factory=list)
+    recent_commitments: list[CommitmentState] = Field(default_factory=list)
+    candidate_reopens_resolved_question: bool = False
+    candidate_conflicts_with_commitment: bool = False
+    candidate_supports_commitment: bool = False
     mafia_public_state: MafiaPublicState | None = None
     mafia_private_state: MafiaPrivateState | None = None
 

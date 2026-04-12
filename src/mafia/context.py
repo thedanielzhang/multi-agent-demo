@@ -5,7 +5,13 @@ import re
 from collections import Counter
 
 from mafia.config import AgentConfig, AppConfig, ContextConfig, ModeProfile
-from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, ConversationMessage, RoomMetricsSnapshot
+from mafia.messages import (
+    AgentContextSnapshot,
+    AgentTopicSnapshot,
+    ConversationMessage,
+    RoomDiscourseStateSnapshot,
+    RoomMetricsSnapshot,
+)
 
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
@@ -28,6 +34,7 @@ class ContextAssembler:
         current_time,
         recent_messages: list[ConversationMessage],
         room_metrics: RoomMetricsSnapshot,
+        discourse_state: RoomDiscourseStateSnapshot,
         topic_snapshot: AgentTopicSnapshot | None,
         buffer_size: int,
         buffer_version: int,
@@ -66,6 +73,7 @@ class ContextAssembler:
             topic_snapshot_id=topic_snapshot.snapshot_id if topic_snapshot else None,
             topic_snapshot=topic_snapshot.model_copy(deep=True) if topic_snapshot else None,
             room_metrics=room_metrics,
+            discourse_state=discourse_state,
             memory_summary=memory_summary,
             active_participant_count=room_metrics.active_participant_count,
             agent_message_rate=room_metrics.agent_message_rates.get(agent.id, 0.0),

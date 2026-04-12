@@ -263,8 +263,25 @@ class BaseAgentWorker:
                 "buffer_size": context.buffer_size,
                 "candidate_preview_text": input_data.candidate_preview_text,
                 "candidate_similarity_score": round(input_data.candidate_similarity_score, 3),
+                "strict_turn_active": input_data.strict_turn_active,
+                "slot_owner_id": input_data.slot_owner_id,
+                "slot_reason": input_data.slot_reason,
+                "reply_target_display_name": input_data.reply_target_display_name,
+                "reply_target_reason": input_data.reply_target_reason,
+                "obligation_strength": input_data.obligation_strength,
+                "floor_state": input_data.floor_state,
+                "candidate_turn_kind": input_data.candidate_turn_kind,
+                "candidate_matches_slot": input_data.candidate_matches_slot,
+                "candidate_answers_open_question_id": input_data.candidate_answers_open_question_id,
+                "candidate_reopens_resolved_question": input_data.candidate_reopens_resolved_question,
+                "candidate_conflicts_with_commitment": input_data.candidate_conflicts_with_commitment,
+                "candidate_supports_commitment": input_data.candidate_supports_commitment,
                 "similar_recent_message_text": input_data.similar_recent_message_text,
+                "similar_recent_same_reply_target": input_data.similar_recent_same_reply_target,
+                "similar_recent_same_turn_kind": input_data.similar_recent_same_turn_kind,
                 "inflight_similarity_score": round(input_data.inflight_similarity_score, 3),
+                "similar_inflight_same_reply_target": input_data.similar_inflight_same_reply_target,
+                "similar_inflight_same_turn_kind": input_data.similar_inflight_same_turn_kind,
                 "other_agents_typing_count": input_data.other_agents_typing_count,
                 "time_since_last_any": round(context.time_since_last_any, 3),
                 "time_since_last_own": round(context.time_since_last_own, 3),
@@ -290,6 +307,11 @@ class BaseAgentWorker:
                 "topic_snapshot_id": context.topic_snapshot_id,
                 "max_words": input_data.max_words,
                 "style_prompt": input_data.style_prompt,
+                "contribution_mode": input_data.contribution_mode,
+                "owns_response_slot": input_data.owns_response_slot,
+                "open_question_count": len(input_data.recent_open_questions),
+                "accepted_commitment_count": len(input_data.accepted_commitments),
+                "rejected_commitment_count": len(input_data.rejected_commitments),
             }
             if input_data.mafia_private_state is not None and input_data.mafia_public_state is not None:
                 summary.update(
@@ -827,6 +849,11 @@ class AgentDeliveryWorker:
         if self.engine.policies.candidate_is_stale(self.agent, reservation.candidate, utc_now()):
             await self._abort(command, reservation_id=reservation.reservation_id, candidate_id=reservation.candidate.candidate_id, reason="reservation_expired")
             return
+        context = self.engine.registry.agent_view(self.agent)
+        discourse_reason = self.engine.policies.discourse_guard_reason(self.agent, context, reservation.candidate)
+        if discourse_reason is not None:
+            await self._abort(command, reservation_id=reservation.reservation_id, candidate_id=reservation.candidate.candidate_id, reason=discourse_reason)
+            return
         delay = self.engine.policies.typing_delay(reservation.candidate.text)
         await self.engine.append_event(
             make_event(
@@ -863,6 +890,11 @@ class AgentDeliveryWorker:
             return
         if self.engine.policies.candidate_is_stale(self.agent, reservation.candidate, utc_now()):
             await self._abort(command, reservation_id=reservation.reservation_id, candidate_id=reservation.candidate.candidate_id, reason="reservation_expired")
+            return
+        context = self.engine.registry.agent_view(self.agent)
+        discourse_reason = self.engine.policies.discourse_guard_reason(self.agent, context, reservation.candidate)
+        if discourse_reason is not None:
+            await self._abort(command, reservation_id=reservation.reservation_id, candidate_id=reservation.candidate.candidate_id, reason=discourse_reason)
             return
         await self.engine.append_event(
             make_event(

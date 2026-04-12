@@ -122,6 +122,7 @@ class ChatRoomService:
             "active_config": self._active_config.model_dump(mode="json") if self._active_config else None,
             "runtime_validation": self._runtime_validation(self._draft_config),
             "mafia_state": _json_ready(self._engine.registry.mafia_public_state().model_dump(mode="json")) if self._engine and self._engine.registry.mafia_public_state() else None,
+            "mafia_lobby_spinup": self._mafia_lobby_spinup_status(current, run_state=run_state),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -399,6 +400,9 @@ class ChatRoomService:
         }
         self._debug_events.append(payload)
         await self._broadcast(payload)
+        spinup = self._mafia_lobby_spinup_status()
+        if spinup and spinup["active"]:
+            await self._broadcast_presence()
 
     async def _broadcast(self, payload: dict[str, Any]) -> None:
         if not self._sockets:
@@ -425,6 +429,7 @@ class ChatRoomService:
                 "viewer_count": len(self._sockets),
                 "participants": list(self._participants.values()),
                 "viewer_presence": self._viewer_presence(),
+                "mafia_lobby_spinup": self._mafia_lobby_spinup_status(),
             }
         )
 
@@ -461,6 +466,81 @@ class ChatRoomService:
             )
         return public
 
+    def _mafia_lobby_spinup_status(
+        self,
+        config: AppConfig | None = None,
+        *,
+        run_state: str | None = None,
+    ) -> dict[str, Any] | None:
+        current = config or self._draft_config
+        if current.room_mode != RoomMode.MAFIA:
+            return None
+        effective_run_state = run_state or (self._engine.registry.run_state() if self._engine is not None else "idle")
+        public_state = self._engine.registry.mafia_public_state() if self._engine else None
+        active = (
+            self._engine is not None
+            and effective_run_state == "running"
+            and public_state is not None
+            and public_state.game_status == MafiaGameStatus.LOBBY
+            and public_state.phase == MafiaPhase.LOBBY
+        )
+
+        ready_count = 0
+        failed_count = 0
+        agents: list[dict[str, Any]] = []
+        for agent in current.agents:
+            agent_status = "idle"
+            error: str | None = None
+            if active and self._engine is not None:
+                if self._engine.registry.buffer_for(agent.id):
+                    agent_status = "ready"
+                    ready_count += 1
+                else:
+                    latest_debug = self._latest_lobby_spinup_debug(agent.id)
+                    if latest_debug and latest_debug.get("subject") == "debug.event.agent.call.failed":
+                        agent_status = "failed"
+                        failed_count += 1
+                        error = str((latest_debug.get("event") or {}).get("error") or "")
+                    else:
+                        agent_status = "spinning_up"
+            payload = {
+                "participant_id": agent.id,
+                "display_name": agent.display_name,
+                "status": agent_status,
+            }
+            if error:
+                payload["error"] = error
+            agents.append(payload)
+
+        total_agents = len(current.agents)
+        return {
+            "active": active,
+            "ready": total_agents == 0 or ready_count == total_agents,
+            "total_agents": total_agents,
+            "ready_count": ready_count,
+            "failed_count": failed_count,
+            "pending_count": max(0, total_agents - ready_count - failed_count) if active else 0,
+            "agents": agents,
+        }
+
+    def _latest_lobby_spinup_debug(self, agent_id: str) -> dict[str, Any] | None:
+        for entry in reversed(self._debug_events):
+            event = entry.get("event") or {}
+            invocation = event.get("invocation") or {}
+            if event.get("agent_id") != agent_id:
+                continue
+            if event.get("worker_kind") != "generator":
+                continue
+            if not invocation.get("mafia_lobby_spinup"):
+                continue
+            if entry.get("subject") in {
+                "debug.event.agent.call.started",
+                "debug.event.agent.call.completed",
+                "debug.event.agent.call.failed",
+            }:
+                return entry
+        return None
+
     async def _send_player_state(self, websocket: WebSocket, participant_id: str) -> None:
         if self._engine is None or self._draft_config.room_mode != RoomMode.MAFIA:
             return
@@ -482,6 +562,19 @@ class ChatRoomService:
         public_state = self._engine.registry.mafia_public_state()
         if public_state is None or public_state.game_status != MafiaGameStatus.LOBBY:
             return
+        spinup = self._mafia_lobby_spinup_status(self._active_config or self._draft_config, run_state="running")
+        if spinup is not None and not spinup["ready"]:
+            blocked = [agent["display_name"] for agent in spinup["agents"] if agent["status"] != "ready"]
+            failed = [agent["display_name"] for agent in spinup["agents"] if agent["status"] == "failed"]
+            if failed:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"agents failed to spin up: {', '.join(failed)}",
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=f"agents are still spinning up: {', '.join(blocked)}",
+            )
         slots = self._eligible_lobby_slots()
         ready = [viewer for viewer in slots if viewer["ready"] and viewer["participant_id"] and viewer["display_name"]]
         humans = [

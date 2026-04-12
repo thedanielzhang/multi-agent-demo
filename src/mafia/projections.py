@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 
 from mafia.config import AgentConfig, AppConfig, ModeProfile
-from mafia.context import ContextAssembler, entropy_from_keywords, keyword_sketch
+from mafia.context import ContextAssembler, entropy_from_keywords, keyword_sketch, tokenize
 from mafia.event_log import EventLog
 from mafia.messages import (
     AgentContextSnapshot,
@@ -14,12 +15,30 @@ from mafia.messages import (
     MafiaPublicState,
     AgentTopicSnapshot,
     CandidateRecord,
+    CommitmentState,
     ConversationMessage,
     DeliveryReservation,
     LoggedEvent,
+    OpenQuestionState,
+    ResponseSlotState,
+    RoomDiscourseStateSnapshot,
     RoomMetricsSnapshot,
+    SenderKind,
     utc_now,
 )
+
+_QUESTION_STARTERS = {"what", "why", "how", "when", "where", "who", "which", "should", "could", "would", "do", "does", "did", "can", "is", "are"}
+_STRICT_TURN_PHRASES = (
+    "one at a time",
+    "the floor is yours",
+    "go ahead",
+    "let's hear from",
+    "lets hear from",
+    "who wants to go first",
+)
+_ACCEPTANCE_PHRASES = ("yes", "correct", "locked", "confirmed", "should be", "must", "that's right", "that is right")
+_REJECTION_PHRASES = ("no context switching", "already locked", "don't", "dont", "shouldn't", "shouldnt", "must not")
+_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
 class RunStateProjection:
@@ -218,6 +237,201 @@ class RoomMetricsProjection:
         )
 
 
+class RoomDiscourseProjection:
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self.snapshot = RoomDiscourseStateSnapshot()
+        self._agent_ids = [agent.id for agent in config.agents]
+        self._goal_tokens = {
+            agent.id: set(tokenize(" ".join([agent.display_name, *agent.goals, agent.style_prompt])))
+            for agent in config.agents
+        }
+        self._display_names = {
+            agent.id: self._normalize(agent.display_name)
+            for agent in config.agents
+        }
+
+    def apply(self, logged_event: LoggedEvent, timeline: ConversationTimelineProjection) -> None:
+        if logged_event.event.subject != "conversation.event.message.committed":
+            return
+        self.snapshot = self._recompute(timeline.messages)
+
+    def _recompute(self, messages: list[ConversationMessage]) -> RoomDiscourseStateSnapshot:
+        slot = ResponseSlotState()
+        open_questions: list[OpenQuestionState] = []
+        resolved_ids: list[str] = []
+        accepted: list[CommitmentState] = []
+        rejected: list[CommitmentState] = []
+        last_owner: str | None = None
+
+        for message in messages:
+            if message.sender_kind == SenderKind.HUMAN:
+                self._resolve_open_questions(open_questions, resolved_ids, message)
+                slot = ResponseSlotState()
+                slot_owner, slot_reason = self._slot_from_human_message(message, last_owner)
+                if slot_owner:
+                    slot = ResponseSlotState(
+                        active=True,
+                        owner_id=slot_owner,
+                        reason=slot_reason,
+                        source_message_id=message.message_id,
+                    )
+                    last_owner = slot_owner
+                if self._is_question(message.text):
+                    open_questions.append(
+                        OpenQuestionState(
+                            question_id=message.message_id,
+                            source_message_id=message.message_id,
+                            asker_id=message.sender_id,
+                            asker_display_name=message.display_name,
+                            target_participant_id=slot_owner if slot_reason == "direct_question" else None,
+                            text_excerpt=message.text[:180],
+                            keyword_sketch=keyword_sketch([message], limit=6),
+                            created_at=message.created_at,
+                        )
+                    )
+                commitment = self._commitment_from_human_message(message)
+                if commitment is not None:
+                    if commitment.polarity == "accepted":
+                        accepted.append(commitment)
+                    else:
+                        rejected.append(commitment)
+            elif slot.active and message.sender_id == slot.owner_id:
+                slot = ResponseSlotState()
+
+        unresolved = [question for question in open_questions if not question.resolved]
+        resolved = [question for question in open_questions if question.resolved]
+        return RoomDiscourseStateSnapshot(
+            strict_turn_active=slot.active,
+            slot_owner_id=slot.owner_id,
+            slot_reason=slot.reason,
+            slot_source_message_id=slot.source_message_id,
+            open_questions=unresolved,
+            resolved_question_ids=resolved_ids,
+            resolved_questions=resolved[-8:],
+            accepted_commitments=accepted[-8:],
+            rejected_commitments=rejected[-8:],
+            last_strict_turn_owner_id=last_owner,
+        )
+
+    def _normalize(self, text: str | None) -> str:
+        return _NORMALIZE_RE.sub(" ", (text or "").casefold()).strip()
+
+    def _is_question(self, text: str) -> bool:
+        compact = text.strip().lower()
+        if not compact:
+            return False
+        if "?" in compact:
+            return True
+        tokens = tokenize(compact)
+        return bool(tokens and tokens[0] in _QUESTION_STARTERS)
+
+    def _is_strict_turn_cue(self, text: str) -> bool:
+        compact = self._normalize(text)
+        return any(phrase in compact for phrase in _STRICT_TURN_PHRASES)
+
+    def _find_named_agent(self, message: ConversationMessage) -> str | None:
+        for mention in message.mentions:
+            if mention in self._agent_ids:
+                return mention
+        lowered = self._normalize(message.text)
+        for agent_id in self._agent_ids:
+            display_name = self._display_names.get(agent_id) or ""
+            if display_name and re.search(rf"\b{re.escape(display_name)}\b", lowered):
+                return agent_id
+            if len(agent_id) >= 3 and re.search(rf"\b{re.escape(self._normalize(agent_id))}\b", lowered):
+                return agent_id
+        return None
+
+    def _goal_keyword_owner(self, text: str) -> str | None:
+        message_tokens = set(tokenize(text))
+        best_agent_id: str | None = None
+        best_score = 0
+        for agent_id in self._agent_ids:
+            overlap = len(message_tokens & self._goal_tokens.get(agent_id, set()))
+            if overlap > best_score:
+                best_score = overlap
+                best_agent_id = agent_id
+        return best_agent_id if best_score > 0 else None
+
+    def _round_robin_owner(self, last_owner: str | None) -> str | None:
+        if not self._agent_ids:
+            return None
+        if last_owner not in self._agent_ids:
+            return self._agent_ids[0]
+        index = self._agent_ids.index(last_owner)
+        return self._agent_ids[(index + 1) % len(self._agent_ids)]
+
+    def _slot_from_human_message(self, message: ConversationMessage, last_owner: str | None) -> tuple[str | None, str]:
+        named_target = self._find_named_agent(message)
+        if self._is_question(message.text) and named_target is not None:
+            return named_target, "direct_question"
+        if self._is_strict_turn_cue(message.text):
+            if named_target is not None:
+                return named_target, "strict_turn_named"
+            owner = self._goal_keyword_owner(message.text) or self._round_robin_owner(last_owner)
+            return owner, "strict_turn_unnamed" if owner is not None else "none"
+        return None, "none"
+
+    def _has_acceptance_cue(self, text: str) -> bool:
+        lowered = text.casefold()
+        return any(phrase in lowered for phrase in _ACCEPTANCE_PHRASES)
+
+    def _has_rejection_cue(self, text: str) -> bool:
+        lowered = text.casefold()
+        if any(phrase in lowered for phrase in _REJECTION_PHRASES):
+            return True
+        return bool(re.search(r"\b(no|not|never)\b", lowered))
+
+    def _commitment_from_human_message(self, message: ConversationMessage) -> CommitmentState | None:
+        text = message.text.strip()
+        if not text:
+            return None
+        polarity: str | None = None
+        if self._has_rejection_cue(text):
+            polarity = "rejected"
+        elif self._has_acceptance_cue(text):
+            polarity = "accepted"
+        if polarity is None:
+            return None
+        return CommitmentState(
+            source_message_id=message.message_id,
+            polarity=polarity,
+            keyword_sketch=keyword_sketch([message], limit=6),
+            canonical_text=text[:180],
+            created_at=message.created_at,
+        )
+
+    def _resolve_open_questions(
+        self,
+        open_questions: list[OpenQuestionState],
+        resolved_ids: list[str],
+        message: ConversationMessage,
+    ) -> None:
+        unresolved = [question for question in open_questions if not question.resolved]
+        if not unresolved:
+            return
+        message_tokens = set(tokenize(message.text))
+        answer_like = (
+            not self._is_question(message.text)
+            or self._has_acceptance_cue(message.text)
+            or self._has_rejection_cue(message.text)
+        )
+        if not answer_like:
+            return
+        for question in reversed(unresolved):
+            overlap = len(message_tokens & set(question.keyword_sketch))
+            if overlap > 0 or question.asker_id != message.sender_id:
+                question.resolved = True
+                question.resolved_by_message_id = message.message_id
+                resolved_ids.append(question.question_id)
+                return
+        latest = unresolved[-1]
+        latest.resolved = True
+        latest.resolved_by_message_id = message.message_id
+        resolved_ids.append(latest.question_id)
+
+
 def _detect_shift(recent: list[ConversationMessage]) -> bool:
     if len(recent) < 4:
         return False
@@ -253,6 +467,7 @@ class ProjectionRegistry:
         self._topics = AgentTopicProjection()
         self._mafia = MafiaProjection()
         self._room_metrics = RoomMetricsProjection()
+        self._discourse = RoomDiscourseProjection(config)
         self._watermark = 0
         self._condition = asyncio.Condition()
         self._task: asyncio.Task[None] | None = None
@@ -310,6 +525,7 @@ class ProjectionRegistry:
             current_time=now,
             recent_messages=recent_messages,
             room_metrics=room_metrics,
+            discourse_state=self._discourse.snapshot.model_copy(deep=True),
             topic_snapshot=topic_snapshot.model_copy(deep=True) if topic_snapshot else None,
             buffer_size=len(self._buffers.buffers.get(agent.id, [])),
             buffer_version=self._buffers.versions.get(agent.id, 0),
@@ -335,6 +551,9 @@ class ProjectionRegistry:
         snapshot = self._topics.snapshots.get(agent_id)
         return snapshot.model_copy(deep=True) if snapshot else None
 
+    def discourse_state(self) -> RoomDiscourseStateSnapshot:
+        return self._discourse.snapshot.model_copy(deep=True)
+
     def mafia_snapshot(self) -> MafiaGameSnapshot | None:
         snapshot = self._mafia.snapshot
         return snapshot.model_copy(deep=True) if snapshot else None
@@ -359,6 +578,7 @@ class ProjectionRegistry:
                 self._topics.apply(logged_event)
                 self._mafia.apply(logged_event)
                 self._room_metrics.apply(logged_event, self._timeline)
+                self._discourse.apply(logged_event, self._timeline)
                 self._watermark = logged_event.seq
                 seq = logged_event.seq
             async with self._condition:

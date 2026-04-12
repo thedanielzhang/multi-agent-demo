@@ -38,23 +38,62 @@ class ScriptedAgentLogic:
                 decision="send" if opening_pressure >= 0.35 else "wait",
                 reason="room-opening" if opening_pressure >= 0.35 else "room-idle-wait",
             )
-        if context.has_sent_message and context.time_since_last_own < max(0.12, 0.72 - (talkativeness * 0.45)):
-            return SchedulerReply(decision="wait", reason="recent-own-message")
-        if context.time_since_last_any < max(0.04, 0.24 - (reactivity * 0.1)):
-            return SchedulerReply(decision="wait", reason="conversation-active")
-        if (
+        if snapshot.strict_turn_active and snapshot.slot_owner_id not in {None, context.agent_id}:
+            return SchedulerReply(decision="wait", reason="strict_turn_slot_taken")
+        exact_duplicate_recent = (
             snapshot.has_buffered_candidate
             and snapshot.candidate_similarity_score >= 0.96
+            and snapshot.similar_recent_same_reply_target
+            and snapshot.similar_recent_same_turn_kind
             and (snapshot.similar_recent_message_age_seconds or 999.0) <= 4.0
+        )
+        exact_duplicate_inflight = (
+            snapshot.has_buffered_candidate
+            and snapshot.inflight_similarity_score >= 0.97
+            and snapshot.similar_inflight_same_reply_target
+            and snapshot.similar_inflight_same_turn_kind
+        )
+        if snapshot.candidate_reopens_resolved_question:
+            return SchedulerReply(decision="wait", reason="resolved_question_reopened")
+        if snapshot.candidate_conflicts_with_commitment:
+            return SchedulerReply(decision="wait", reason="conflicts_with_commitment")
+        if snapshot.obligation_strength == "high":
+            return SchedulerReply(
+                decision="wait" if exact_duplicate_recent or exact_duplicate_inflight else "send",
+                reason="addressed-obligation" if not (exact_duplicate_recent or exact_duplicate_inflight) else "duplicate-recent-message",
+            )
+        if snapshot.floor_state == "addressed_response_slot" and snapshot.obligation_strength == "medium":
+            return SchedulerReply(
+                decision="wait" if exact_duplicate_recent or exact_duplicate_inflight else "send",
+                reason="addressed-response-slot" if not (exact_duplicate_recent or exact_duplicate_inflight) else "duplicate-recent-message",
+            )
+        if (
+            snapshot.floor_state == "cooldown_after_self_turn"
+            and snapshot.obligation_strength in {"none", "low"}
+            and context.has_sent_message
+            and context.time_since_last_own < max(0.12, 0.72 - (talkativeness * 0.45))
         ):
+            return SchedulerReply(decision="wait", reason="recent-own-message")
+        if (
+            snapshot.floor_state != "brief_overlap_ok"
+            and context.time_since_last_any < max(0.04, 0.24 - (reactivity * 0.1))
+        ):
+            return SchedulerReply(decision="wait", reason="conversation-active")
+        if exact_duplicate_recent:
             return SchedulerReply(decision="wait", reason="duplicate-recent-message")
-        if snapshot.has_buffered_candidate and snapshot.inflight_similarity_score >= 0.97:
+        if exact_duplicate_inflight:
             return SchedulerReply(decision="wait", reason="duplicate-inflight-message")
 
         baseline_pressure = talkativeness + (confidence * 0.25)
         buffered_pressure = talkativeness + (confidence * 0.2)
         if snapshot.talk_mode == "talkative":
             buffered_pressure += 0.1
+        if snapshot.floor_state == "brief_overlap_ok" and snapshot.candidate_turn_kind in {"backchannel", "agreement", "answer", "challenge"}:
+            buffered_pressure += 0.12
+        if snapshot.obligation_strength == "medium":
+            buffered_pressure += 0.08
+        if snapshot.reply_target_reason in {"direct_mention", "reply_hint"}:
+            buffered_pressure += 0.05
 
         if snapshot.has_buffered_candidate and context.buffer_size > 0:
             return SchedulerReply(

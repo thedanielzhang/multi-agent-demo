@@ -618,6 +618,7 @@ function useRoomService(roomId, enabled = true) {
             viewer_count: payload.viewer_count,
             participants: payload.participants,
             viewer_presence: payload.viewer_presence,
+            mafia_lobby_spinup: payload.mafia_lobby_spinup,
           }));
           return;
         }
@@ -806,6 +807,7 @@ function roomPrimaryState(service) {
   const joined = service.joinedParticipant;
   const isMafia = mafiaModeOf(service.status);
   const mafiaState = service.status?.mafia_state;
+  const spinup = service.status?.mafia_lobby_spinup;
   const playerState = service.playerState;
 
   if (!connected) {
@@ -839,10 +841,21 @@ function roomPrimaryState(service) {
     };
   }
   if (mafiaState.phase === "lobby") {
+    if (spinup?.active && !spinup?.ready) {
+      return {
+        title: spinup.failed_count ? "Agent warmup needs attention" : "Agents are spinning up",
+        detail: spinup.failed_count
+          ? "Some model seats failed to warm up. Check the debug drawer or restart the room."
+          : `Preparing ${spinup.ready_count} of ${spinup.total_agents} model seats before the game begins.`,
+        tone: spinup.failed_count ? "warning" : "neutral",
+      };
+    }
     return {
       title: "Seated and ready",
-      detail: "The creator can start once the connected players have claimed their seats.",
-      tone: "neutral",
+      detail: spinup?.active
+        ? "Every model seat is warmed, so the creator can start without the initial agent spin-up delay."
+        : "The creator can start once the room is ready.",
+      tone: spinup?.active ? "online" : "neutral",
     };
   }
   if (playerState?.alive === false) {
@@ -877,6 +890,7 @@ function RoomStatusStrip({ service }) {
   const state = roomPrimaryState(service);
   const isMafia = mafiaModeOf(service.status);
   const mafiaState = service.status?.mafia_state;
+  const spinup = service.status?.mafia_lobby_spinup;
   const joined = service.joinedParticipant;
 
   return html`
@@ -894,6 +908,11 @@ function RoomStatusStrip({ service }) {
         ${isMafia && mafiaState ? html`
           <${StatusBadge} tone=${mafiaState.phase === "day_vote" || mafiaState.phase === "night_action" ? "warning" : "neutral"}>
             ${phaseLabel(mafiaState.phase)}
+          </${StatusBadge}>
+        ` : null}
+        ${isMafia && mafiaState?.phase === "lobby" && spinup?.active ? html`
+          <${StatusBadge} tone=${spinup.ready ? "online" : spinup.failed_count ? "warning" : "neutral"}>
+            ${spinup.ready ? "Agents ready" : spinup.failed_count ? "Agent warmup failed" : `Agents ${spinup.ready_count}/${spinup.total_agents}`}
           </${StatusBadge}>
         ` : null}
         <${StatusBadge} tone=${service.socketState === "open" ? "online" : "warning"}>
@@ -1000,6 +1019,8 @@ function PresenceList({ status, joinedParticipant }) {
 function MafiaReadyList({ status, joinedParticipant }) {
   const viewers = status?.viewer_presence || [];
   const mafiaState = status?.mafia_state;
+  const spinup = status?.mafia_lobby_spinup;
+  const agentSeats = spinup?.agents || [];
   const seatedIds = new Set((mafiaState?.roster || []).map((entry) => entry.participant_id));
   const capacity = mafiaState?.total_players || status?.draft_config?.mafia?.total_players || 0;
   const readyCount = viewers.filter((viewer) => viewer.ready).length;
@@ -1010,29 +1031,75 @@ function MafiaReadyList({ status, joinedParticipant }) {
         <span className="section-label">Lobby progress</span>
         <p>${readyCount} of ${Math.min(capacity || viewers.length || 0, viewers.length || capacity || 0)} connected humans have claimed a seat.</p>
       </div>
-      <div className="presence-list">
-        ${viewers.length
-          ? viewers.map((viewer, index) => {
-              const isJoined = viewer.ready && viewer.participant_id;
-              const isPlayer = viewer.participant_id && seatedIds.has(viewer.participant_id);
-              return html`
-                <div className=${`presence-item ${joinedParticipant?.participant_id === viewer.participant_id ? "is-self" : ""}`} key=${viewer.viewer_id}>
-                  <div className="avatar human">${avatarLabel(viewer.display_name || `Viewer ${index + 1}`)}</div>
-                  <div className="presence-copy">
-                    <strong>${viewer.display_name || `Viewer ${index + 1}`}</strong>
-                    <span>
-                      ${!isJoined
-                        ? "Connected, not seated yet"
-                        : isPlayer || mafiaState?.game_status === "lobby"
-                          ? "Ready for the next game"
-                          : "Watching as spectator"}
-                    </span>
+      <div className="summary-card">
+        <span className="section-label">Model warmup</span>
+        <p>
+          ${spinup?.active
+            ? spinup.ready
+              ? `All ${spinup.total_agents} model seats are warmed and ready to start.`
+              : spinup.failed_count
+                ? `${spinup.failed_count} model seat${spinup.failed_count === 1 ? "" : "s"} failed to warm up. Check debug before starting over.`
+                : `Preparing ${spinup.ready_count} of ${spinup.total_agents} model seats before the game begins.`
+            : "Model seats warm up in the lobby before the round starts."}
+        </p>
+      </div>
+      <div className="presence-block">
+        <div className="section-label">Connected humans</div>
+        <div className="presence-list">
+          ${viewers.length
+            ? viewers.map((viewer, index) => {
+                const isJoined = viewer.ready && viewer.participant_id;
+                const isPlayer = viewer.participant_id && seatedIds.has(viewer.participant_id);
+                return html`
+                  <div className=${`presence-item ${joinedParticipant?.participant_id === viewer.participant_id ? "is-self" : ""}`} key=${viewer.viewer_id}>
+                    <div className="avatar human">${avatarLabel(viewer.display_name || `Viewer ${index + 1}`)}</div>
+                    <div className="presence-copy">
+                      <strong>${viewer.display_name || `Viewer ${index + 1}`}</strong>
+                      <span>
+                        ${!isJoined
+                          ? "Connected, not seated yet"
+                          : isPlayer || mafiaState?.game_status === "lobby"
+                            ? "Ready for the next game"
+                            : "Watching as spectator"}
+                      </span>
+                    </div>
+                    <${StatusBadge} tone=${isJoined ? "online" : "muted"}>${isJoined ? "Ready" : "Waiting"}</${StatusBadge}>
                   </div>
-                  <${StatusBadge} tone=${isJoined ? "online" : "muted"}>${isJoined ? "Ready" : "Waiting"}</${StatusBadge}>
-                </div>
-              `;
-            })
-          : html`<div className="empty-inline">Waiting for people to open the room link.</div>`}
+                `;
+              })
+            : html`<div className="empty-inline">Waiting for people to open the room link.</div>`}
+        </div>
+      </div>
+      <div className="presence-block">
+        <div className="section-label">Model seats</div>
+        <div className="presence-list">
+          ${agentSeats.length
+            ? agentSeats.map((agent) => {
+                const tone = agent.status === "ready" ? "online" : agent.status === "failed" ? "warning" : "neutral";
+                const label = agent.status === "ready"
+                  ? "Ready"
+                  : agent.status === "failed"
+                    ? "Failed"
+                    : agent.status === "spinning_up"
+                      ? "Spinning up"
+                      : "Idle";
+                return html`
+                  <div className="presence-item agent" key=${agent.participant_id}>
+                    <div className="avatar agent">${avatarLabel(agent.display_name)}</div>
+                    <div className="presence-copy">
+                      <strong>${agent.display_name}</strong>
+                      <span>${agent.status === "ready"
+                        ? "First response is prebuffered for the opening day."
+                        : agent.status === "failed"
+                          ? (agent.error || "Warmup failed")
+                          : "Preparing an opening candidate in the lobby."}</span>
+                    </div>
+                    <${StatusBadge} tone=${tone}>${label}</${StatusBadge}>
+                  </div>
+                `;
+              })
+            : html`<div className="empty-inline">No model seats configured.</div>`}
+        </div>
       </div>
     </div>
   `;
@@ -1040,6 +1107,7 @@ function MafiaReadyList({ status, joinedParticipant }) {
 
 function MafiaPhaseCard({ service }) {
   const mafiaState = service.status?.mafia_state;
+  const spinup = service.status?.mafia_lobby_spinup;
   const playerState = service.playerState;
   const countdown = useCountdown(mafiaState?.phase_ends_at);
   const premise = service.status?.scenario;
@@ -1087,7 +1155,7 @@ function MafiaPhaseCard({ service }) {
         : "Seats are locked in, but roles are not assigned until the game leaves the lobby.";
 
   const phaseCopy = mafiaState.phase === "lobby"
-    ? "Everyone connected needs to claim a seat with a name before the game can start."
+    ? "Humans can claim seats with names here while the model seats warm up in the background."
     : mafiaState.phase === "day_discussion"
       ? "Talk publicly, read the room, and decide who you trust before voting opens."
       : mafiaState.phase === "day_vote"
@@ -1124,6 +1192,20 @@ function MafiaPhaseCard({ service }) {
       : "Advancing to the next phase now."
     : "The creator starts the game from the lobby.";
 
+  const startBlocked = mafiaState.game_status === "lobby" && spinup?.active && !spinup?.ready;
+  const startButtonLabel = startBlocked
+    ? spinup?.failed_count
+      ? "Agent warmup failed"
+      : "Agents spinning up"
+    : "Start game";
+  const startSummary = startBlocked
+    ? spinup?.failed_count
+      ? "Some model seats failed to warm up. Check the debug drawer or restart the room."
+      : `Preparing ${spinup?.ready_count || 0} of ${spinup?.total_agents || 0} model seats before the round begins.`
+    : spinup?.active
+      ? "All model seats are warm. Starting now should avoid the first-turn spin-up delay."
+      : "Start the game from the lobby once the room is ready.";
+
   return html`
     <section className="mafia-phase-card">
       <div className="phase-chip-row">
@@ -1150,14 +1232,15 @@ function MafiaPhaseCard({ service }) {
             <div className="phase-action-row">
               <div className="summary-card">
                 <span className="section-label">Primary action</span>
-                <p>Start the game from the lobby once the players you want are seated.</p>
+                <p>${startSummary}</p>
               </div>
               <button
                 className="button"
                 type="button"
+                disabled=${startBlocked}
                 onClick=${() => service.startRun().catch((error) => service.setError(error.message || String(error)))}
               >
-                Start game
+                ${startButtonLabel}
               </button>
             </div>
           `
@@ -1484,7 +1567,7 @@ function JoinComposer({ service }) {
           <strong>${isMafia ? "Claim a seat in the lobby" : "Join before you speak"}</strong>
           <span>
             ${isMafia
-              ? "Claim a seat with a name, then wait for the room creator to start once everyone connected is ready."
+              ? "Claim a seat with a name, then wait while the model seats finish warming up and the room creator starts the round."
               : "Everyone in the room sees when you connect, so your invitees know who arrived."}
           </span>
         </div>
@@ -1510,7 +1593,7 @@ function JoinComposer({ service }) {
       : playerState?.alive === false
         ? "You were eliminated. You can still follow the room, but you can’t speak anymore."
         : mafiaState?.phase === "lobby"
-          ? "You’ve claimed a seat. The room creator can start once everyone connected has joined with a name."
+          ? "You’ve claimed a seat. The room creator can start once the model seats finish warming up."
           : mafiaState?.phase === "day_vote"
             ? "Public chat pauses during the secret day vote."
             : mafiaState?.phase === "night_action"

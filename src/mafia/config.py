@@ -97,7 +97,7 @@ class PolicyProfile(BaseModel):
 
 class AppConfig(BaseModel):
     room_mode: RoomMode = RoomMode.REGULAR
-    mode: ModeProfile = ModeProfile.BASELINE_TIME_TO_TALK
+    mode: ModeProfile = ModeProfile.IMPROVED_BUFFERED_ASYNC
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     chat: ChatConfig
