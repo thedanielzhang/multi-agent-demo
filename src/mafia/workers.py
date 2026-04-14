@@ -1011,10 +1011,13 @@ class ImprovedAgentWorkflowRunner:
         self._task: asyncio.Task[None] | None = None
         self._follow_up_task: asyncio.Task[None] | None = None
         self._analysis_task: asyncio.Task[None] | None = None
+        self._generation_task: asyncio.Task[None] | None = None
         self._closed = False
 
     async def close(self) -> None:
         self._closed = True
+        if self._generation_task:
+            self._generation_task.cancel()
         if self._analysis_task:
             self._analysis_task.cancel()
         if self._follow_up_task:
@@ -1022,6 +1025,8 @@ class ImprovedAgentWorkflowRunner:
         if self._task:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+        if self._generation_task:
+            await asyncio.gather(self._generation_task, return_exceptions=True)
         if self._analysis_task:
             await asyncio.gather(self._analysis_task, return_exceptions=True)
         if self._follow_up_task:
@@ -1163,7 +1168,12 @@ class ImprovedAgentWorkflowRunner:
                     reason="mafia_chat_disabled",
                 )
                 return
+            await self._run_mafia_discussion_workflow(trigger)
+            return
 
+        await self._run_standard_workflow(trigger)
+
+    async def _run_standard_workflow(self, trigger: WorkflowTrigger) -> None:
         generated_candidate: dict[str, object] | None = None
         scheduler_decision: dict[str, object] | None = None
 
@@ -1194,20 +1204,36 @@ class ImprovedAgentWorkflowRunner:
                 "decision": reply.decision,
                 "reason": reply.reason,
             }
-
-        context = self.engine.registry.agent_view(self.agent)
-        topic_snapshot = context.topic_snapshot
-        await self._emit(
-            "debug.event.agent.workflow.completed",
-            trigger=trigger,
-            effective_watermark=max(trigger.trigger_watermark, self.engine.registry.watermark),
-            rerun_pending=bool(self._pending),
+        await self._complete_live_workflow(
+            trigger,
+            reply=reply,
             generated_candidate=generated_candidate,
             scheduler_decision=scheduler_decision,
         )
-        if self.config.topic.enabled and (topic_snapshot is None or topic_snapshot.watermark < context.watermark):
-            self._ensure_background_analysis(trigger, context)
-        self._maybe_schedule_follow_up(trigger, reply)
+
+    async def _run_mafia_discussion_workflow(self, trigger: WorkflowTrigger) -> None:
+        scheduler_decision: dict[str, object] | None = None
+
+        context = self.engine.registry.agent_view(self.agent)
+        await self.buffer_worker.discard_stale(command=self._workflow_command("evict", trigger))
+        context = self.engine.registry.agent_view(self.agent)
+
+        reply = await self.scheduler.run_step(
+            command=self._workflow_command("schedule", trigger),
+            context=context,
+        )
+        if reply is not None:
+            scheduler_decision = {
+                "decision": reply.decision,
+                "reason": reply.reason,
+            }
+        await self._complete_live_workflow(
+            trigger,
+            reply=reply,
+            generated_candidate=None,
+            scheduler_decision=scheduler_decision,
+        )
+        self._ensure_background_generation(trigger)
 
     async def _run_mafia_spinup(
         self,
@@ -1248,6 +1274,28 @@ class ImprovedAgentWorkflowRunner:
                 "reason": reason,
             },
         )
+
+    async def _complete_live_workflow(
+        self,
+        trigger: WorkflowTrigger,
+        *,
+        reply: SchedulerReply | None,
+        generated_candidate: dict[str, object] | None,
+        scheduler_decision: dict[str, object] | None,
+    ) -> None:
+        context = self.engine.registry.agent_view(self.agent)
+        topic_snapshot = context.topic_snapshot
+        await self._emit(
+            "debug.event.agent.workflow.completed",
+            trigger=trigger,
+            effective_watermark=max(trigger.trigger_watermark, self.engine.registry.watermark),
+            rerun_pending=bool(self._pending),
+            generated_candidate=generated_candidate,
+            scheduler_decision=scheduler_decision,
+        )
+        if self.config.topic.enabled and (topic_snapshot is None or topic_snapshot.watermark < context.watermark):
+            self._ensure_background_analysis(trigger, context)
+        self._maybe_schedule_follow_up(trigger, reply)
 
     def _workflow_command(
         self,
@@ -1344,6 +1392,51 @@ class ImprovedAgentWorkflowRunner:
         if self._follow_up_task and not self._follow_up_task.done():
             self._follow_up_task.cancel()
         self._follow_up_task = None
+
+    def _ensure_background_generation(self, trigger: WorkflowTrigger) -> None:
+        if self._closed or self.config.room_mode.value != "mafia":
+            return
+        if self.engine.registry.run_state() != "running":
+            return
+        if self._generation_task and not self._generation_task.done():
+            return
+        if self.engine.registry.active_reservation_for(self.agent.id) is not None:
+            return
+        if self.engine.registry.buffer_for(self.agent.id):
+            return
+        public_state = self.engine.registry.mafia_public_state()
+        private_state = self.engine.registry.mafia_private_state_for(self.agent.id)
+        if public_state is None or private_state is None:
+            return
+        if public_state.phase != MafiaPhase.DAY_DISCUSSION or not private_state.can_chat:
+            return
+        self._generation_task = self.engine.create_background_task(
+            self._run_background_generation(trigger),
+            f"workflow-generate.{self.agent.id}",
+        )
+
+    async def _run_background_generation(self, trigger: WorkflowTrigger) -> None:
+        try:
+            if self._closed or self.engine.registry.run_state() != "running":
+                return
+            context = self.engine.registry.agent_view(self.agent)
+            candidate = await self.generator.run_step(
+                command=self._workflow_command("generate", trigger),
+                context=context,
+                enqueue_schedule=False,
+            )
+            if candidate is None or self._closed or self.engine.registry.run_state() != "running":
+                return
+            await self.notify(
+                WorkflowTrigger(
+                    trigger_kind="buffer_ready",
+                    trigger_watermark=self.engine.registry.watermark,
+                    trigger_message_id=trigger.trigger_message_id,
+                    trigger_sender_id=trigger.trigger_sender_id,
+                )
+            )
+        finally:
+            self._generation_task = None
 
     def _ensure_background_analysis(self, trigger: WorkflowTrigger, context: AgentContextSnapshot) -> None:
         if self._closed:

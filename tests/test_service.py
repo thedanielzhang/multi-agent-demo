@@ -89,6 +89,7 @@ def test_app_config_defaults_regular_rooms_to_improved_mode():
     )
     assert config.room_mode == RoomMode.REGULAR
     assert config.mode == ModeProfile.IMPROVED_BUFFERED_ASYNC
+    assert config.authority.human_users_authoritative is True
 
 
 def test_two_humans_receive_same_committed_message(baseline_config):

@@ -20,6 +20,7 @@ from mafia.messages import (
     MafiaPublicState,
     MafiaVoteInputSnapshot,
     OpenQuestionState,
+    ProposalState,
     RoomMetricsSnapshot,
     RoomDiscourseStateSnapshot,
     SchedulerInputSnapshot,
@@ -246,6 +247,10 @@ class PromptPolicy:
             f"- {question.text_excerpt}"
             for question in snapshot.recent_open_questions[:3]
         ) or "(none)"
+        recent_proposals = "\n".join(
+            f"- {proposal.proposer_display_name}: {proposal.canonical_text}"
+            for proposal in snapshot.recent_proposals[:4]
+        ) or "(none)"
         accepted_commitments = "\n".join(
             f"- {commitment.canonical_text}"
             for commitment in snapshot.accepted_commitments[:4]
@@ -288,6 +293,8 @@ class PromptPolicy:
             f"Maximum words: {snapshot.max_words}\n"
             f"Current room keywords: {topic_summary}\n"
             f"You currently own the response slot: {snapshot.owns_response_slot}\n"
+            "Recent participant proposals (tentative context only):\n"
+            f"{recent_proposals}\n"
             "Recent accepted decisions:\n"
             f"{accepted_commitments}\n"
             "Recent rejected decisions:\n"
@@ -296,6 +303,7 @@ class PromptPolicy:
             f"{open_questions}\n"
             f"{mafia_chatroom_guidance}"
             "Role changes the type of contribution, not the amount of formality.\n"
+            "Treat participant proposals as tentative unless they are also reflected in accepted or rejected decisions.\n"
             "Turn accepted decisions into useful next steps. Do not reopen settled tradeoffs.\n"
             "If you are translating into interface implications, avoid repetitive status chatter like 'sketching now' unless directly asked for status.\n"
             "Focused context window:\n"
@@ -462,7 +470,11 @@ class PolicySet:
         other_agents_typing_count: int,
         mafia_public_state: MafiaPublicState | None,
     ) -> Literal["open_floor", "addressed_response_slot", "brief_overlap_ok", "cooldown_after_self_turn"]:
-        if context.discourse_state.strict_turn_active and context.discourse_state.slot_owner_id == agent.id:
+        if (
+            self._config.room_mode.value != "mafia"
+            and context.discourse_state.strict_turn_active
+            and context.discourse_state.slot_owner_id == agent.id
+        ):
             return "addressed_response_slot"
         if obligation_strength == "high":
             return "addressed_response_slot"
@@ -561,6 +573,9 @@ class PolicySet:
 
     def _recent_commitments(self, discourse_state: RoomDiscourseStateSnapshot) -> list[CommitmentState]:
         return [*discourse_state.accepted_commitments[-3:], *discourse_state.rejected_commitments[-3:]][-6:]
+
+    def _recent_proposals(self, discourse_state: RoomDiscourseStateSnapshot) -> list[ProposalState]:
+        return discourse_state.recent_proposals[-4:]
 
     def _text_overlap_ratio(self, tokens: set[str], keywords: list[str]) -> float:
         keyword_set = {keyword.casefold() for keyword in keywords if keyword}
@@ -669,7 +684,11 @@ class PolicySet:
         candidate: CandidateRecord,
     ) -> str | None:
         discourse_state = context.discourse_state
-        if discourse_state.strict_turn_active and discourse_state.slot_owner_id not in {None, agent.id}:
+        if (
+            self._config.room_mode.value != "mafia"
+            and discourse_state.strict_turn_active
+            and discourse_state.slot_owner_id not in {None, agent.id}
+        ):
             return "strict_turn_slot_taken"
         candidate_turn_kind = candidate.metadata.get("candidate_turn_kind") or self._candidate_turn_kind(agent, candidate.text, None, context)
         if self._candidate_reopens_resolved_question(candidate.text, candidate_turn_kind, discourse_state):
@@ -714,7 +733,14 @@ class PolicySet:
         reply_target_display_name = reply_target.display_name if reply_target is not None else None
         obligation_strength = self._obligation_strength(agent, reply_target, reply_target_reason)
         discourse_state = context.discourse_state
-        if discourse_state.strict_turn_active and discourse_state.slot_owner_id not in {None, agent.id}:
+        strict_turn_active = discourse_state.strict_turn_active
+        slot_owner_id = discourse_state.slot_owner_id
+        slot_reason = discourse_state.slot_reason
+        if self._config.room_mode.value == "mafia":
+            strict_turn_active = False
+            slot_owner_id = None
+            slot_reason = "none"
+        if strict_turn_active and slot_owner_id not in {None, agent.id}:
             obligation_strength = "none"
         floor_state = self._floor_state(
             agent,
@@ -723,9 +749,6 @@ class PolicySet:
             other_agents_typing_count,
             mafia_public_state,
         )
-        strict_turn_active = discourse_state.strict_turn_active
-        slot_owner_id = discourse_state.slot_owner_id
-        slot_reason = discourse_state.slot_reason
         recent_open_questions = discourse_state.open_questions[-3:]
         recent_commitments = self._recent_commitments(discourse_state)
         candidate_turn_kind: Literal["backchannel", "agreement", "answer", "challenge", "proposal", "repair", "summary", "pivot", "stance"] = "stance"
@@ -865,14 +888,21 @@ class PolicySet:
         mafia_public_state: MafiaPublicState | None = None,
         mafia_private_state: MafiaPrivateState | None = None,
     ) -> GeneratorInputSnapshot:
+        owns_response_slot = (
+            not context.discourse_state.strict_turn_active
+            or context.discourse_state.slot_owner_id == agent.id
+        )
+        if self._config.room_mode.value == "mafia":
+            owns_response_slot = True
         return GeneratorInputSnapshot(
             scenario=self._config.chat.scenario,
             agent_context=context,
             max_words=agent.max_words,
             style_prompt=agent.style_prompt,
             contribution_mode=self._contribution_mode(agent),
-            owns_response_slot=(not context.discourse_state.strict_turn_active or context.discourse_state.slot_owner_id == agent.id),
+            owns_response_slot=owns_response_slot,
             recent_open_questions=context.discourse_state.open_questions[-3:],
+            recent_proposals=self._recent_proposals(context.discourse_state),
             accepted_commitments=context.discourse_state.accepted_commitments[-4:],
             rejected_commitments=context.discourse_state.rejected_commitments[-4:],
             mafia_public_state=mafia_public_state,

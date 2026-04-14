@@ -53,4 +53,17 @@ class ScriptedAgentRuntime(AgentRuntime):
         match = re.search(r"INPUT_JSON:\n(?P<payload>\{.*\})\s*$", prompt, re.DOTALL)
         if not match:
             return {}
-        return json.loads(match.group("payload"))
+        return self._normalize_sender_kinds(json.loads(match.group("payload")))
+
+    def _normalize_sender_kinds(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "sender_kind" and item == "participant":
+                    normalized[key] = "human"
+                    continue
+                normalized[key] = self._normalize_sender_kinds(item)
+            return normalized
+        if isinstance(value, list):
+            return [self._normalize_sender_kinds(item) for item in value]
+        return value

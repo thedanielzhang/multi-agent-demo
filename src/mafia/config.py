@@ -48,6 +48,10 @@ class TopicConfig(BaseModel):
     max_topics: int = 3
 
 
+class AuthorityConfig(BaseModel):
+    human_users_authoritative: bool = True
+
+
 class MafiaConfig(BaseModel):
     total_players: int = Field(default=6, ge=5, le=13)
     day_discussion_seconds: float = 270.0
@@ -103,6 +107,7 @@ class AppConfig(BaseModel):
     chat: ChatConfig
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     topic: TopicConfig = Field(default_factory=TopicConfig)
+    authority: AuthorityConfig = Field(default_factory=AuthorityConfig)
     mafia: MafiaConfig = Field(default_factory=MafiaConfig)
     context_defaults: ContextConfig = Field(default_factory=ContextConfig)
     agents: list[AgentConfig]

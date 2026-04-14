@@ -132,11 +132,18 @@ class AgentInvoker:
 
     def _sanitize_input_payload(self, value: Any) -> Any:
         if isinstance(value, dict):
-            return {
-                key: self._sanitize_input_payload(item)
-                for key, item in value.items()
-                if key != "is_human"
-            }
+            cleaned: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "is_human":
+                    continue
+                if key == "sender_kind":
+                    if item in {"human", "agent"}:
+                        cleaned[key] = "participant"
+                    else:
+                        cleaned[key] = item
+                    continue
+                cleaned[key] = self._sanitize_input_payload(item)
+            return cleaned
         if isinstance(value, list):
             return [self._sanitize_input_payload(item) for item in value]
         return value

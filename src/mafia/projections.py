@@ -20,6 +20,7 @@ from mafia.messages import (
     DeliveryReservation,
     LoggedEvent,
     OpenQuestionState,
+    ProposalState,
     ResponseSlotState,
     RoomDiscourseStateSnapshot,
     RoomMetricsSnapshot,
@@ -39,6 +40,7 @@ _STRICT_TURN_PHRASES = (
 _ACCEPTANCE_PHRASES = ("yes", "correct", "locked", "confirmed", "should be", "must", "that's right", "that is right")
 _REJECTION_PHRASES = ("no context switching", "already locked", "don't", "dont", "shouldn't", "shouldnt", "must not")
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+_PROPOSAL_SKIP_TOKENS = {"ok", "okay", "yes", "yeah", "yep", "nope", "sure", "right", "cool", "thanks", "thank", "exactly", "agreed"}
 
 
 class RunStateProjection:
@@ -260,23 +262,28 @@ class RoomDiscourseProjection:
         slot = ResponseSlotState()
         open_questions: list[OpenQuestionState] = []
         resolved_ids: list[str] = []
+        proposals: list[ProposalState] = []
         accepted: list[CommitmentState] = []
         rejected: list[CommitmentState] = []
         last_owner: str | None = None
+        strict_turn_enabled = self._config.room_mode.value != "mafia"
 
         for message in messages:
-            if message.sender_kind == SenderKind.HUMAN:
+            if self._is_participant_message(message):
                 self._resolve_open_questions(open_questions, resolved_ids, message)
                 slot = ResponseSlotState()
-                slot_owner, slot_reason = self._slot_from_human_message(message, last_owner)
-                if slot_owner:
-                    slot = ResponseSlotState(
-                        active=True,
-                        owner_id=slot_owner,
-                        reason=slot_reason,
-                        source_message_id=message.message_id,
-                    )
-                    last_owner = slot_owner
+                slot_owner: str | None = None
+                slot_reason = "none"
+                if strict_turn_enabled:
+                    slot_owner, slot_reason = self._slot_from_participant_message(message, last_owner)
+                    if slot_owner:
+                        slot = ResponseSlotState(
+                            active=True,
+                            owner_id=slot_owner,
+                            reason=slot_reason,
+                            source_message_id=message.message_id,
+                        )
+                        last_owner = slot_owner
                 if self._is_question(message.text):
                     open_questions.append(
                         OpenQuestionState(
@@ -290,13 +297,17 @@ class RoomDiscourseProjection:
                             created_at=message.created_at,
                         )
                     )
-                commitment = self._commitment_from_human_message(message)
+                commitment = self._commitment_from_authoritative_message(message)
                 if commitment is not None:
                     if commitment.polarity == "accepted":
                         accepted.append(commitment)
                     else:
                         rejected.append(commitment)
-            elif slot.active and message.sender_id == slot.owner_id:
+                else:
+                    proposal = self._proposal_from_participant_message(message)
+                    if proposal is not None:
+                        proposals.append(proposal)
+            elif strict_turn_enabled and slot.active and message.sender_id == slot.owner_id:
                 slot = ResponseSlotState()
 
         unresolved = [question for question in open_questions if not question.resolved]
@@ -309,10 +320,25 @@ class RoomDiscourseProjection:
             open_questions=unresolved,
             resolved_question_ids=resolved_ids,
             resolved_questions=resolved[-8:],
+            recent_proposals=proposals[-8:],
             accepted_commitments=accepted[-8:],
             rejected_commitments=rejected[-8:],
             last_strict_turn_owner_id=last_owner,
         )
+
+    def _is_participant_message(self, message: ConversationMessage) -> bool:
+        return message.sender_kind in {SenderKind.HUMAN, SenderKind.AGENT}
+
+    def _is_authoritative_message(self, message: ConversationMessage) -> bool:
+        if message.sender_kind == SenderKind.SYSTEM:
+            return True
+        if not self._is_participant_message(message):
+            return False
+        if self._config.room_mode.value == "mafia":
+            return True
+        if self._config.authority.human_users_authoritative:
+            return message.sender_kind == SenderKind.HUMAN
+        return True
 
     def _normalize(self, text: str | None) -> str:
         return _NORMALIZE_RE.sub(" ", (text or "").casefold()).strip()
@@ -362,7 +388,7 @@ class RoomDiscourseProjection:
         index = self._agent_ids.index(last_owner)
         return self._agent_ids[(index + 1) % len(self._agent_ids)]
 
-    def _slot_from_human_message(self, message: ConversationMessage, last_owner: str | None) -> tuple[str | None, str]:
+    def _slot_from_participant_message(self, message: ConversationMessage, last_owner: str | None) -> tuple[str | None, str]:
         named_target = self._find_named_agent(message)
         if self._is_question(message.text) and named_target is not None:
             return named_target, "direct_question"
@@ -383,7 +409,9 @@ class RoomDiscourseProjection:
             return True
         return bool(re.search(r"\b(no|not|never)\b", lowered))
 
-    def _commitment_from_human_message(self, message: ConversationMessage) -> CommitmentState | None:
+    def _commitment_from_authoritative_message(self, message: ConversationMessage) -> CommitmentState | None:
+        if not self._is_authoritative_message(message):
+            return None
         text = message.text.strip()
         if not text:
             return None
@@ -397,6 +425,26 @@ class RoomDiscourseProjection:
         return CommitmentState(
             source_message_id=message.message_id,
             polarity=polarity,
+            keyword_sketch=keyword_sketch([message], limit=6),
+            canonical_text=text[:180],
+            created_at=message.created_at,
+        )
+
+    def _proposal_from_participant_message(self, message: ConversationMessage) -> ProposalState | None:
+        if not self._is_participant_message(message):
+            return None
+        text = message.text.strip()
+        if not text or self._is_question(text) or self._is_strict_turn_cue(text):
+            return None
+        tokens = tokenize(text)
+        if len(tokens) < 3:
+            return None
+        if set(tokens).issubset(_PROPOSAL_SKIP_TOKENS):
+            return None
+        return ProposalState(
+            source_message_id=message.message_id,
+            proposer_id=message.sender_id,
+            proposer_display_name=message.display_name,
             keyword_sketch=keyword_sketch([message], limit=6),
             canonical_text=text[:180],
             created_at=message.created_at,

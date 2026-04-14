@@ -16,9 +16,9 @@ from mafia.agent import AgentInvoker
 from mafia.compose_compat import Workspace
 from mafia.engine import ConversationEngine, load_config
 from mafia.event_log import EventLog
-from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, MafiaFaction, MafiaGameSnapshot, MafiaGameStatus, MafiaPhase, MafiaPlayerRecord, MafiaPrivateState, MafiaPublicState, MafiaRole, RoomMetricsSnapshot, SchedulerInputSnapshot, TopicSummary, make_event, utc_now
+from mafia.messages import AgentContextSnapshot, AgentTopicSnapshot, AnalyzerReply, CommandEnvelope, LoggedEvent, MafiaFaction, MafiaGameSnapshot, MafiaGameStatus, MafiaPhase, MafiaPlayerRecord, MafiaPrivateState, MafiaPublicState, MafiaRole, RoomMetricsSnapshot, SchedulerInputSnapshot, SchedulerReply, TopicSummary, make_event, utc_now
 from mafia.mafia_controller import MafiaGameController, mafia_count_for_players
-from mafia.messages import CandidateRecord, CommitmentState, ConversationMessage, DeliveryReservation, OpenQuestionState, ResponseSlotState, RoomDiscourseStateSnapshot
+from mafia.messages import CandidateRecord, CommitmentState, ConversationMessage, DeliveryReservation, OpenQuestionState, ProposalState, ResponseSlotState, RoomDiscourseStateSnapshot
 from mafia.mafia_personas import generate_mafia_personas
 from mafia.policies import PolicySet
 from mafia.projections import ProjectionRegistry
@@ -82,6 +82,43 @@ async def _wait_for_event(
         await asyncio.sleep(0.02)
 
 
+async def _discard_agent_buffer(engine: ConversationEngine, agent_id: str) -> None:
+    for candidate in list(engine.registry.buffer_for(agent_id)):
+        await engine.append_event_and_wait(
+            make_event(
+                f"agent.event.{agent_id}.candidate.discarded",
+                payload={
+                    "agent_id": agent_id,
+                    "candidate_id": candidate.candidate_id,
+                    "reason": "test_clear",
+                },
+            )
+        )
+
+
+def _mafia_day_discussion_snapshot(agent, *, round_no: int = 1) -> MafiaGameSnapshot:
+    started_at = utc_now()
+    return MafiaGameSnapshot(
+        game_status=MafiaGameStatus.ACTIVE,
+        phase=MafiaPhase.DAY_DISCUSSION,
+        phase_started_at=started_at,
+        phase_ends_at=started_at + timedelta(seconds=45),
+        total_players=1,
+        round_no=round_no,
+        players=[
+            MafiaPlayerRecord(
+                participant_id=agent.id,
+                display_name=agent.display_name,
+                is_human=False,
+                seat_index=0,
+                role=MafiaRole.TOWN,
+                faction=MafiaFaction.TOWN,
+                connected=True,
+            )
+        ],
+    )
+
+
 class CapturingRuntime(ScriptedAgentRuntime):
     def __init__(self) -> None:
         super().__init__()
@@ -139,6 +176,30 @@ class CountingSlowGeneratorRuntime(ScriptedAgentRuntime):
         if role.name == "generator":
             self.generator_calls += 1
             await asyncio.sleep(self.delay_seconds)
+        return await super().invoke(role, prompt, **kwargs)
+
+
+class SequencedGeneratorRuntime(ScriptedAgentRuntime):
+    def __init__(self, delays: list[float], *, wait_on_buffered_scheduler: bool = False) -> None:
+        super().__init__()
+        self.delays = delays or [0.0]
+        self.wait_on_buffered_scheduler = wait_on_buffered_scheduler
+        self.generator_calls = 0
+        self.scheduler_calls = 0
+
+    async def invoke(self, role, prompt: str, **kwargs):
+        if role.name == "scheduler":
+            self.scheduler_calls += 1
+            if self.wait_on_buffered_scheduler:
+                snapshot = SchedulerInputSnapshot.model_validate(self._parse_input(prompt))
+                if snapshot.has_buffered_candidate:
+                    return SchedulerReply(decision="wait", reason="buffered-not-relevant")
+        if role.name == "generator":
+            delay_index = min(self.generator_calls, len(self.delays) - 1)
+            delay_seconds = self.delays[delay_index]
+            self.generator_calls += 1
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
         return await super().invoke(role, prompt, **kwargs)
 
 
@@ -483,6 +544,69 @@ def test_agent_input_json_strips_is_human_from_mafia_payloads(improved_config):
     assert "\"display_name\": \"Alex\"" in prompt
 
 
+def test_agent_input_json_collapses_public_sender_kind_to_participant(improved_config):
+    config = improved_config.model_copy(deep=True)
+    invoker = AgentInvoker(
+        ScriptedAgentRuntime(),
+        "run-test",
+        Workspace(id="ws-test", path=ROOT),
+    )
+    now = utc_now()
+    context = AgentContextSnapshot(
+        agent_id=config.agents[0].id,
+        watermark=3,
+        current_time=now,
+        recent_messages=[
+            _message(
+                message_id="m1",
+                client_message_id="c1",
+                sender_id="human-1",
+                display_name="Daniel",
+                text="hello there",
+                created_at=now,
+                sequence_no=1,
+            ),
+            _message(
+                message_id="m2",
+                client_message_id="c2",
+                sender_id=config.agents[1].id,
+                display_name=config.agents[1].display_name,
+                sender_kind="agent",
+                text="I think isolation matters.",
+                created_at=now + timedelta(seconds=1),
+                sequence_no=2,
+            ),
+            _message(
+                message_id="m3",
+                client_message_id="c3",
+                sender_id="system",
+                display_name="System",
+                sender_kind="system",
+                text="Day 1 begins.",
+                created_at=now + timedelta(seconds=2),
+                sequence_no=3,
+            ),
+        ],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        discourse_state=RoomDiscourseStateSnapshot(),
+        active_participant_count=3,
+        time_since_last_any=0.5,
+        time_since_last_own=5.0,
+        buffer_size=0,
+        buffer_version=0,
+        run_state="running",
+    )
+    prompt = invoker._compose_prompt(
+        "generator prompt",
+        PolicySet(config).generator_input(config.agents[0], context),
+    )
+    assert "\"sender_kind\": \"participant\"" in prompt
+    assert "\"sender_kind\": \"system\"" in prompt
+    assert "\"sender_kind\": \"human\"" not in prompt
+    assert "\"sender_kind\": \"agent\"" not in prompt
+
+
 def test_mafia_count_for_players_matches_original_ratio():
     assert mafia_count_for_players(5) == 2
     assert mafia_count_for_players(6) == 2
@@ -685,6 +809,196 @@ async def test_mafia_night_reveal_spinup_prebuffers_for_next_day(improved_config
         for logged in events
     )
     await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_scheduler_does_not_wait_for_generation_when_day_opens_with_empty_buffer(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    runtime = SequencedGeneratorRuntime([0.0, 0.35])
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=1.5,
+    )
+    await _discard_agent_buffer(engine, config.agents[0].id)
+    day_logged = await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=_mafia_day_discussion_snapshot(config.agents[0]),
+        )
+    )
+    scheduler_wait = await _wait_for_event(
+        engine,
+        lambda logged: logged.seq > day_logged.seq
+        and logged.event.subject == f"agent.event.{config.agents[0].id}.scheduler.decided"
+        and logged.event.payload["reason"] == "no-buffered-candidate",
+        timeout=1.0,
+    )
+    generator_completed = await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.completed"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "generator"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase",
+        timeout=2.0,
+    )
+    assert scheduler_wait.seq < generator_completed.seq
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_generation_completion_retriggers_scheduler_with_buffer_ready(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    runtime = SequencedGeneratorRuntime([0.0, 0.2])
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=1.5,
+    )
+    await _discard_agent_buffer(engine, config.agents[0].id)
+    day_logged = await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=_mafia_day_discussion_snapshot(config.agents[0]),
+        )
+    )
+    buffer_ready_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.seq > day_logged.seq
+        and logged.event.subject == "debug.event.agent.workflow.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["trigger_kind"] == "buffer_ready",
+        timeout=2.0,
+    )
+    scheduler_started = await _wait_for_event(
+        engine,
+        lambda logged: logged.seq > buffer_ready_started.seq
+        and logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "scheduler"
+        and logged.event.payload["invocation"]["trigger_kind"] == "buffer_ready",
+        timeout=2.0,
+    )
+    assert scheduler_started.event.payload["command_subject"] == f"agent.workflow.{config.agents[0].id}.schedule"
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_buffer_ready_still_waits_for_scheduler_before_any_send(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    runtime = SequencedGeneratorRuntime([0.0, 0.2], wait_on_buffered_scheduler=True)
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=1.5,
+    )
+    await _discard_agent_buffer(engine, config.agents[0].id)
+    day_logged = await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=_mafia_day_discussion_snapshot(config.agents[0]),
+        )
+    )
+    wait_decision = await _wait_for_event(
+        engine,
+        lambda logged: logged.seq > day_logged.seq
+        and logged.event.subject == f"agent.event.{config.agents[0].id}.scheduler.decided"
+        and logged.event.payload["reason"] == "buffered-not-relevant",
+        timeout=2.0,
+    )
+    await asyncio.sleep(0.1)
+    events = await engine.export_events()
+    assert not any(
+        logged.seq > wait_decision.seq
+        and logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.reserved"
+        for logged in events
+    )
+    assert not any(
+        logged.seq > wait_decision.seq
+        and logged.event.subject == "conversation.event.message.committed"
+        and logged.event.payload["sender_id"] == config.agents[0].id
+        for logged in events
+    )
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_inflight_generation_is_not_duplicated_by_room_messages(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    runtime = SequencedGeneratorRuntime([0.0, 0.5])
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=1.5,
+    )
+    baseline_generator_calls = runtime.generator_calls
+    await _discard_agent_buffer(engine, config.agents[0].id)
+    await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=_mafia_day_discussion_snapshot(config.agents[0]),
+        )
+    )
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "generator"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase",
+        timeout=1.0,
+    )
+    await engine.submit_message(text="who feels suspicious so far?")
+    await engine.submit_message(text="i want more concrete reads")
+    await asyncio.sleep(0.15)
+    assert runtime.generator_calls == baseline_generator_calls + 1
+    await _shutdown(engine)
+
+
+@pytest.mark.asyncio
+async def test_mafia_shutdown_cancels_inflight_background_generation(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    config.agents = [config.agents[0]]
+    runtime = SequencedGeneratorRuntime([0.0, 5.0])
+    engine = ConversationEngine(config, runtime=runtime)
+    await engine.start()
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == f"agent.event.{config.agents[0].id}.candidate.buffered",
+        timeout=1.5,
+    )
+    await _discard_agent_buffer(engine, config.agents[0].id)
+    await engine.append_event_and_wait(
+        make_event(
+            "mafia.event.snapshot.updated",
+            payload=_mafia_day_discussion_snapshot(config.agents[0]),
+        )
+    )
+    await _wait_for_event(
+        engine,
+        lambda logged: logged.event.subject == "debug.event.agent.call.started"
+        and logged.event.payload["agent_id"] == config.agents[0].id
+        and logged.event.payload["worker_kind"] == "generator"
+        and logged.event.payload["invocation"]["trigger_kind"] == "mafia_phase",
+        timeout=1.0,
+    )
+    await asyncio.wait_for(_shutdown(engine), timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -1307,6 +1621,99 @@ async def test_discourse_projection_direct_question_assigns_and_clears_slot(impr
 
 
 @pytest.mark.asyncio
+async def test_mafia_discourse_projection_does_not_assign_strict_turn_for_direct_question(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, config)
+    await registry.start()
+    agent = config.agents[0]
+    now = utc_now()
+
+    question = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id="human-1",
+        display_name="Daniel",
+        text=f"{agent.display_name}, what do you mean by that?",
+        created_at=now,
+        sequence_no=1,
+        mentions=[agent.id],
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=question.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    state = registry.discourse_state()
+    assert state.strict_turn_active is False
+    assert state.slot_owner_id is None
+    assert state.slot_reason == "none"
+    assert state.open_questions[0].target_participant_id is None
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_tracks_agent_questions_source_agnostically(improved_config):
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, improved_config)
+    await registry.start()
+    now = utc_now()
+    asker = improved_config.agents[0]
+    target = improved_config.agents[1]
+
+    question = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id=asker.id,
+        display_name=asker.display_name,
+        sender_kind="agent",
+        text=f"{target.display_name}, what do you mean by shared pain?",
+        created_at=now,
+        sequence_no=1,
+        mentions=[target.id],
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=question.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    state = registry.discourse_state()
+    assert state.strict_turn_active is True
+    assert state.slot_owner_id == target.id
+    assert state.open_questions[0].asker_id == asker.id
+    assert state.open_questions[0].target_participant_id == target.id
+
+    answer = _message(
+        message_id="m2",
+        client_message_id="c2",
+        sender_id=target.id,
+        display_name=target.display_name,
+        sender_kind="agent",
+        text="I mean we all share the operational costs.",
+        created_at=now + timedelta(seconds=1),
+        sequence_no=2,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=answer.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+    state = registry.discourse_state()
+    assert state.strict_turn_active is False
+    assert state.slot_owner_id is None
+    assert "m1" in state.resolved_question_ids
+    await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_discourse_projection_unnamed_strict_turn_uses_round_robin(improved_config):
     event_log = EventLog()
     registry = ProjectionRegistry(event_log, improved_config)
@@ -1426,6 +1833,107 @@ async def test_discourse_projection_tracks_resolved_questions_and_commitments(im
     await registry.close()
 
 
+@pytest.mark.asyncio
+async def test_discourse_projection_tracks_agent_proposals_without_ratifying_when_humans_authoritative(improved_config):
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, improved_config)
+    await registry.start()
+    now = utc_now()
+    agent = improved_config.agents[0]
+
+    proposal = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id=agent.id,
+        display_name=agent.display_name,
+        sender_kind="agent",
+        text="State isolation should be locked per project.",
+        created_at=now,
+        sequence_no=1,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=proposal.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    state = registry.discourse_state()
+    assert any(item.source_message_id == "m1" for item in state.recent_proposals)
+    assert not state.accepted_commitments
+    assert not state.rejected_commitments
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_ratifies_agent_claims_in_mafia_mode_even_when_humans_authoritative(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, config)
+    await registry.start()
+    now = utc_now()
+    agent = config.agents[0]
+
+    claim = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id=agent.id,
+        display_name=agent.display_name,
+        sender_kind="agent",
+        text="State isolation should be locked per project.",
+        created_at=now,
+        sequence_no=1,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=claim.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    state = registry.discourse_state()
+    assert any(commitment.source_message_id == "m1" for commitment in state.accepted_commitments)
+    assert not state.recent_proposals
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_discourse_projection_can_ratify_agent_claims_when_human_authority_is_disabled(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.authority.human_users_authoritative = False
+    event_log = EventLog()
+    registry = ProjectionRegistry(event_log, config)
+    await registry.start()
+    now = utc_now()
+    agent = config.agents[0]
+
+    claim = _message(
+        message_id="m1",
+        client_message_id="c1",
+        sender_id=agent.id,
+        display_name=agent.display_name,
+        sender_kind="agent",
+        text="State isolation should be locked per project.",
+        created_at=now,
+        sequence_no=1,
+    )
+    logged = await event_log.append(
+        make_event(
+            "conversation.event.message.committed",
+            payload=claim.model_dump(mode="json"),
+        )
+    )
+    await registry.wait_until(logged.seq)
+
+    state = registry.discourse_state()
+    assert any(commitment.source_message_id == "m1" for commitment in state.accepted_commitments)
+    assert not state.recent_proposals
+    await registry.close()
+
+
 def test_scheduler_input_flags_reopening_resolved_question_and_commitment_conflict(improved_config):
     policies = PolicySet(improved_config)
     agent = improved_config.agents[0]
@@ -1519,6 +2027,49 @@ def test_scripted_scheduler_waits_when_strict_turn_belongs_to_someone_else():
     assert reply.reason == "strict_turn_slot_taken"
 
 
+def test_mafia_policy_ignores_strict_turn_state(improved_config):
+    config = improved_config.model_copy(deep=True)
+    config.room_mode = RoomMode.MAFIA
+    policies = PolicySet(config)
+    agent = config.agents[0]
+    current_time = utc_now()
+    context = AgentContextSnapshot(
+        agent_id=agent.id,
+        watermark=2,
+        current_time=current_time,
+        recent_messages=[],
+        focus_messages=[],
+        room_metrics=RoomMetricsSnapshot(active_participant_count=3),
+        discourse_state=RoomDiscourseStateSnapshot(
+            strict_turn_active=True,
+            slot_owner_id="jordan",
+            slot_reason="direct_question",
+        ),
+        active_participant_count=3,
+        time_since_last_any=0.2,
+        time_since_last_own=5.0,
+        buffer_size=1,
+        buffer_version=1,
+        run_state="running",
+    )
+    candidate = CandidateRecord(
+        candidate_id="cand-1",
+        agent_id=agent.id,
+        text="here's my take",
+        created_at=current_time,
+    )
+
+    assert policies.discourse_guard_reason(agent, context, candidate) is None
+
+    scheduler_input = policies.scheduler_input(agent, context, buffer_candidates=[candidate], active_reservations=[])
+    assert scheduler_input.strict_turn_active is False
+    assert scheduler_input.slot_owner_id is None
+    assert scheduler_input.slot_reason == "none"
+
+    generator_input = policies.generator_input(agent, context)
+    assert generator_input.owns_response_slot is True
+
+
 def test_generator_prompt_includes_commitments_and_contribution_mode(improved_config):
     config = improved_config.model_copy(deep=True)
     agent = config.agents[0]
@@ -1538,6 +2089,16 @@ def test_generator_prompt_includes_commitments_and_contribution_mode(improved_co
                 text_excerpt="How should isolation work per project?",
                 keyword_sketch=["isolation", "project"],
                 created_at=current_time - timedelta(seconds=4),
+            )
+        ],
+        recent_proposals=[
+            ProposalState(
+                source_message_id="m0",
+                proposer_id="jordan",
+                proposer_display_name="Jordan",
+                keyword_sketch=["memo", "friday"],
+                canonical_text="We could send a Friday memo first.",
+                created_at=current_time - timedelta(seconds=5),
             )
         ],
         accepted_commitments=[
@@ -1576,6 +2137,8 @@ def test_generator_prompt_includes_commitments_and_contribution_mode(improved_co
     )
     prompt = policies.prompts.generator_prompt(agent, policies.generator_input(agent, context))
     assert "Contribution mode: concretize_constraints" in prompt
+    assert "Recent participant proposals (tentative context only):" in prompt
+    assert "Jordan: We could send a Friday memo first." in prompt
     assert "Recent accepted decisions:" in prompt
     assert "State isolation should be locked per project." in prompt
     assert "Recent rejected decisions:" in prompt

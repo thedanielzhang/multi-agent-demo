@@ -371,6 +371,15 @@ class CommitmentState(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ProposalState(BaseModel):
+    source_message_id: str
+    proposer_id: str
+    proposer_display_name: str
+    keyword_sketch: list[str] = Field(default_factory=list)
+    canonical_text: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class RoomDiscourseStateSnapshot(BaseModel):
     strict_turn_active: bool = False
     slot_owner_id: str | None = None
@@ -379,6 +388,7 @@ class RoomDiscourseStateSnapshot(BaseModel):
     open_questions: list[OpenQuestionState] = Field(default_factory=list)
     resolved_question_ids: list[str] = Field(default_factory=list)
     resolved_questions: list[OpenQuestionState] = Field(default_factory=list)
+    recent_proposals: list[ProposalState] = Field(default_factory=list)
     accepted_commitments: list[CommitmentState] = Field(default_factory=list)
     rejected_commitments: list[CommitmentState] = Field(default_factory=list)
     last_strict_turn_owner_id: str | None = None
@@ -440,6 +450,7 @@ class GeneratorInputSnapshot(BaseModel):
     contribution_mode: Literal["concretize_constraints", "frame_requirements", "translate_into_interface", "generic_collaborator"] = "generic_collaborator"
     owns_response_slot: bool = False
     recent_open_questions: list[OpenQuestionState] = Field(default_factory=list)
+    recent_proposals: list[ProposalState] = Field(default_factory=list)
     accepted_commitments: list[CommitmentState] = Field(default_factory=list)
     rejected_commitments: list[CommitmentState] = Field(default_factory=list)
     mafia_public_state: MafiaPublicState | None = None
